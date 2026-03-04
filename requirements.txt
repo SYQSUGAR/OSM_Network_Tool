@@ -1,0 +1,8 @@
+osm2gmns
+pandas
+geopandas
+shapely
+openpyxl
+PyQt6
+networkx
+osmnx

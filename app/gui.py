@@ -1094,19 +1094,45 @@ class MainWindow(QMainWindow):
             # 3. 添加节点
             if self.show_nodes_cb.isChecked() and nodes_gdf is not None and not nodes_gdf.empty:
                 color_col = self.node_color_attr_combo.currentText()
-                folium.GeoJson(
-                    nodes_gdf,
-                    name="Nodes",
-                    point_to_layer=lambda feature, latlng: folium.CircleMarker(location=latlng, radius=3, color=self.viz_node_color, fill=True, fill_color=self.viz_node_color),
-                    tooltip=folium.GeoJsonTooltip(fields=[color_col], aliases=[f"{color_col}:"])
-                ).add_to(m)
+                for _, row in nodes_gdf.iterrows():
+                    geom = row["geometry"]
+                    val = str(row.get(color_col, ""))
+                    if geom is None:
+                        continue
+                    gtype = getattr(geom, "geom_type", "")
+                    if gtype == "Point":
+                        lat = geom.y
+                        lon = geom.x
+                        folium.CircleMarker(
+                            location=[lat, lon],
+                            radius=3,
+                            color=self.viz_node_color,
+                            fill=True,
+                            fill_color=self.viz_node_color,
+                            tooltip=f"{color_col}: {val}"
+                        ).add_to(m)
+                    elif gtype == "MultiPoint":
+                        for pt in geom.geoms:
+                            lat = pt.y
+                            lon = pt.x
+                            folium.CircleMarker(
+                                location=[lat, lon],
+                                radius=3,
+                                color=self.viz_node_color,
+                                fill=True,
+                                fill_color=self.viz_node_color,
+                                tooltip=f"{color_col}: {val}"
+                            ).add_to(m)
 
             folium.LayerControl().add_to(m)
 
-            # 保存为临时文件并加载
-            temp_file = os.path.join(tempfile.gettempdir(), "osm_preview.html")
-            m.save(temp_file)
-            self.web_view.setUrl(QUrl.fromLocalFile(temp_file))
+            html = m.get_root().render()
+            try:
+                self.web_view.setHtml(html, baseUrl=QUrl("https://folium.local/"))
+            except Exception:
+                temp_file = os.path.join(tempfile.gettempdir(), "osm_preview.html")
+                m.save(temp_file)
+                self.web_view.setUrl(QUrl.fromLocalFile(temp_file))
 
         except Exception as e:
             self.web_view.setHtml(f"<html><body><h3 align='center' style='color:red'>生成地图失败: {str(e)}</h3></body></html>")

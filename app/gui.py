@@ -11,21 +11,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtGui import QStandardItemModel, QStandardItem
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QUrl
 from PyQt6.QtGui import QIcon, QFont
-from importlib import metadata
-WEB_ENGINE_AVAILABLE = False
-WEB_ENGINE_IMPORT_ERROR = None
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
-    # 只要 QWebEngineView 导入成功就认为可用；核心模块异常仅用于诊断显示
     WEB_ENGINE_AVAILABLE = True
-    try:
-        from PyQt6.QtWebEngineCore import QWebEngineProfile  # 进一步确保模块可加载
-    except Exception as _core_e:
-        WEB_ENGINE_IMPORT_ERROR = _core_e
-except Exception as e:
-    WEB_ENGINE_IMPORT_ERROR = e
+except ImportError:
     WEB_ENGINE_AVAILABLE = False
-    print(f"[WebEngine] 导入失败: {e!r}")
+    print("Warning: PyQt6-WebEngine not found. Map visualization will be disabled.")
 
 
 # 导入我们的模块
@@ -71,17 +62,18 @@ class WorkerThread(QThread):
             # ===================
             result = None
             if self.task_type == 'preprocess':
-                self.log_signal.emit("步骤 2/2: 正在执行数据预处理...")
+                self.log_signal.emit("步骤 2/2: 正在执行数据预处理与全量导出...")
                 processor = self.kwargs.get('processor')
-                processor.run_preprocessing(
+                processor.run_full_processing(
                     links_df, nodes_df,
                     self.kwargs.get('node_header_map'),
                     self.kwargs.get('link_header_map'),
                     self.kwargs.get('attr_map'),
+                    self.kwargs.get('output_dir'),
                     log_callback=self.log_signal.emit
                 )
-                self.log_signal.emit(f"--- 预处理成功完成！---")
-                self.finished_signal.emit(True, "预处理成功") # 只发送成功信号
+                self.log_signal.emit(f"--- 处理成功完成！---")
+                self.finished_signal.emit(True, "处理成功") # 只发送成功信号
 
             elif self.task_type == 'export_raw':
                 self.log_signal.emit("步骤 2/2: 正在直接导出原始数据...")
@@ -529,7 +521,7 @@ class MainWindow(QMainWindow):
     def init_viz_tab(self, parent_widget):
         layout = QVBoxLayout(parent_widget)
         
-        self.viz_splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # === Left Panel: Controls ===
         controls_widget = QWidget()
@@ -594,27 +586,23 @@ class MainWindow(QMainWindow):
         self.export_preview_btn.clicked.connect(self.start_preview_export)
         controls_layout.addWidget(self.export_preview_btn)
         
-        diag_btn = QPushButton("诊断WebEngine环境")
-        diag_btn.clicked.connect(self.show_webengine_diagnostics)
-        controls_layout.addWidget(diag_btn)
-        
         # === Right Panel: Map ===
         if WEB_ENGINE_AVAILABLE:
             self.web_view = QWebEngineView()
             self.web_view.setHtml("<html><body><h3 align='center'>请先生成预览数据</h3></body></html>")
-            self.viz_splitter.addWidget(self.web_view)
+            splitter.addWidget(self.web_view)
         else:
-            self.web_view = QLabel(self._webengine_status_text())
+            self.web_view = QLabel("未检测到 PyQt6-WebEngine 库，无法显示地图。\n请尝试手动安装: pip install PyQt6-WebEngine")
             self.web_view.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.web_view.setStyleSheet("background-color: #ecf0f1; color: #7f8c8d; font-size: 16px;")
-            self.viz_splitter.addWidget(self.web_view)
+            splitter.addWidget(self.web_view)
 
         # Add to splitter
-        self.viz_splitter.addWidget(controls_widget)
+        splitter.addWidget(controls_widget)
         # self.web_view added above
-        self.viz_splitter.setStretchFactor(1, 4) # Give map more space
+        splitter.setStretchFactor(1, 4) # Give map more space
         
-        layout.addWidget(self.viz_splitter)
+        layout.addWidget(splitter)
 
     def _update_config_widgets_state(self, checked):
         """根据“格式转换”复选框的状态，启用/禁用相关控件。"""
@@ -1035,10 +1023,7 @@ class MainWindow(QMainWindow):
 
     def update_viz_map(self):
         if not WEB_ENGINE_AVAILABLE:
-            if not self.recheck_webengine_and_upgrade_view():
-                if isinstance(self.web_view, QLabel):
-                    self.web_view.setText(self._webengine_status_text())
-                return
+            return
 
         if self.processor.preview_links_gdf is None:
             return
@@ -1094,96 +1079,23 @@ class MainWindow(QMainWindow):
             # 3. 添加节点
             if self.show_nodes_cb.isChecked() and nodes_gdf is not None and not nodes_gdf.empty:
                 color_col = self.node_color_attr_combo.currentText()
-                for _, row in nodes_gdf.iterrows():
-                    geom = row["geometry"]
-                    val = str(row.get(color_col, ""))
-                    if geom is None:
-                        continue
-                    gtype = getattr(geom, "geom_type", "")
-                    if gtype == "Point":
-                        lat = geom.y
-                        lon = geom.x
-                        folium.CircleMarker(
-                            location=[lat, lon],
-                            radius=3,
-                            color=self.viz_node_color,
-                            fill=True,
-                            fill_color=self.viz_node_color,
-                            tooltip=f"{color_col}: {val}"
-                        ).add_to(m)
-                    elif gtype == "MultiPoint":
-                        for pt in geom.geoms:
-                            lat = pt.y
-                            lon = pt.x
-                            folium.CircleMarker(
-                                location=[lat, lon],
-                                radius=3,
-                                color=self.viz_node_color,
-                                fill=True,
-                                fill_color=self.viz_node_color,
-                                tooltip=f"{color_col}: {val}"
-                            ).add_to(m)
+                folium.GeoJson(
+                    nodes_gdf,
+                    name="Nodes",
+                    point_to_layer=lambda feature, latlng: folium.CircleMarker(location=latlng, radius=3, color=self.viz_node_color, fill=True, fill_color=self.viz_node_color),
+                    tooltip=folium.GeoJsonTooltip(fields=[color_col], aliases=[f"{color_col}:"])
+                ).add_to(m)
 
             folium.LayerControl().add_to(m)
 
-            html = m.get_root().render()
-            try:
-                self.web_view.setHtml(html, baseUrl=QUrl("https://folium.local/"))
-            except Exception:
-                temp_file = os.path.join(tempfile.gettempdir(), "osm_preview.html")
-                m.save(temp_file)
-                self.web_view.setUrl(QUrl.fromLocalFile(temp_file))
+            # 保存为临时文件并加载
+            temp_file = os.path.join(tempfile.gettempdir(), "osm_preview.html")
+            m.save(temp_file)
+            self.web_view.setUrl(QUrl.fromLocalFile(temp_file))
 
         except Exception as e:
             self.web_view.setHtml(f"<html><body><h3 align='center' style='color:red'>生成地图失败: {str(e)}</h3></body></html>")
             print(e)
-    
-    def _webengine_status_text(self):
-        lines = []
-        lines.append("未检测到 PyQt6-WebEngine，或导入失败。")
-        lines.append("请确认在当前Python环境已安装: pip install PyQt6 PyQt6-WebEngine")
-        try:
-            pyqt_ver = metadata.version("PyQt6")
-        except Exception:
-            pyqt_ver = "未安装"
-        try:
-            web_ver = metadata.version("PyQt6-WebEngine")
-        except Exception:
-            web_ver = "未安装"
-        lines.append(f"PyQt6: {pyqt_ver}")
-        lines.append(f"PyQt6-WebEngine: {web_ver}")
-        lines.append(f"Python: {sys.version.split()[0]}")
-        lines.append(f"解释器: {sys.executable}")
-        if WEB_ENGINE_IMPORT_ERROR:
-            lines.append(f"导入错误: {repr(WEB_ENGINE_IMPORT_ERROR)}")
-        return "\n".join(lines)
-    
-    def recheck_webengine_and_upgrade_view(self):
-        global WEB_ENGINE_AVAILABLE, WEB_ENGINE_IMPORT_ERROR, QWebEngineView
-        if WEB_ENGINE_AVAILABLE:
-            return True
-        try:
-            from PyQt6.QtWebEngineWidgets import QWebEngineView as _QEWV
-            QWebEngineView = _QEWV
-            WEB_ENGINE_AVAILABLE = True
-            if isinstance(self.web_view, QLabel):
-                new_view = QWebEngineView()
-                idx = self.viz_splitter.indexOf(self.web_view)
-                if idx != -1:
-                    self.viz_splitter.replaceWidget(idx, new_view)
-                self.web_view = new_view
-            return True
-        except Exception as e:
-            WEB_ENGINE_IMPORT_ERROR = e
-            WEB_ENGINE_AVAILABLE = False
-            return False
-    
-    def show_webengine_diagnostics(self):
-        msg = QMessageBox(self)
-        msg.setWindowTitle("WebEngine 环境诊断")
-        msg.setText(self._webengine_status_text())
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.exec()
 
     def start_preview_export(self):
         output_dir = self.out_input.text().strip()

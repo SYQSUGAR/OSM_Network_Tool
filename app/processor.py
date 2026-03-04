@@ -14,144 +14,185 @@ class DataProcessor:
     def __init__(self):
         self.links_df = None
         self.nodes_df = None
+        # 原始数据备份
         self.source_links_df = None
         self.source_nodes_df = None
-        self.block_stats_df = None
-        self.mapping_files = {}
+        
+        # 全量处理后的数据 (含所有区块，已补全，已去重)
+        self.processed_links_gdf = None
+        self.processed_nodes_gdf = None
+        
+        # 筛选后的预览数据
         self.preview_links_gdf = None
         self.preview_nodes_gdf = None
+        
+        self.block_stats_df = None
+        self.mapping_files = {}
 
-    # --- Stage 1: Pre-processing ---
-    def run_preprocessing(self, links_df, nodes_df, node_map_path, link_map_path, attr_map_path, log_callback=print):
+    # --- Stage 1: Full Processing (Preprocessing + Completion + Deduplication) ---
+    def run_full_processing(self, links_df, nodes_df, node_map_path, link_map_path, attr_map_path, output_dir, log_callback=print):
+        """
+        执行全流程处理：
+        1. 读取映射文件
+        2. 预处理 Link/Node (表头、属性)
+        3. 连通性分析 (计算 Block ID)
+        4. 路段补全 (针对全量数据)
+        5. 移除重复路段 (针对全量数据)
+        6. 生成 GeoDataFrame 并保存为类变量
+        7. 导出全量处理结果到 output_dir
+        """
         self.links_df = links_df.copy()
         self.nodes_df = nodes_df.copy()
-        log_callback("步骤 1/4: 读取映射文件...")
+        
+        # 1. 读取映射
+        log_callback("步骤 1/6: 读取映射文件...")
         self._read_mapping_files(node_map_path, link_map_path, attr_map_path, log_callback)
         
-        log_callback("步骤 2/4: 处理Link数据...")
+        # 2. 预处理
+        log_callback("步骤 2/6: 处理Link数据...")
         self._process_link_headers(log_callback)
         self._process_link_attributes(log_callback)
         
-        log_callback("步骤 3/4: 处理Node数据...")
+        log_callback("步骤 3/6: 处理Node数据...")
         self._process_node_headers(log_callback)
         
-        log_callback("步骤 4/4: 检查区块连通性...")
+        # 3. 连通性分析
+        log_callback("步骤 4/6: 检查区块连通性...")
         self._check_blocks(log_callback)
         
-        # 备份原始处理结果
+        # 备份原始处理结果 (含 Block ID, 但未补全/去重)
         self.source_links_df = self.links_df.copy()
         self.source_nodes_df = self.nodes_df.copy()
         
-        return self.links_df, self.nodes_df, self.block_stats_df
+        # 4. 路段补全 (全量)
+        log_callback("步骤 5/6: 全量路段补全与去重...")
+        self.links_df = self._complete_links(self.links_df, self.nodes_df, log_callback)
+        
+        # 5. 移除重复 (全量)
+        self.links_df = self._remove_duplicate_links(self.links_df, log_callback)
+        
+        # 6. 生成 GeoDataFrame
+        log_callback("步骤 6/6: 生成全量 GeoDataFrame...")
+        try:
+            # 处理 Link Geometry
+            if 'geometry' in self.links_df.columns:
+                self.links_df['geometry'] = self.links_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
+                self.processed_links_gdf = gpd.GeoDataFrame(self.links_df, geometry='geometry')
+                if self.processed_links_gdf.crs is None:
+                    self.processed_links_gdf.set_crs(epsg=4326, inplace=True)
+            
+            # 处理 Node Geometry
+            if 'geometry' in self.nodes_df.columns:
+                self.nodes_df['geometry'] = self.nodes_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
+                self.processed_nodes_gdf = gpd.GeoDataFrame(self.nodes_df, geometry='geometry')
+                if self.processed_nodes_gdf.crs is None:
+                    self.processed_nodes_gdf.set_crs(epsg=4326, inplace=True)
+            
+            # 7. 自动导出全量数据
+            self._export_full_processed_data(output_dir, log_callback)
+            
+            log_callback("全量数据处理与导出完成！")
+            return True
 
-    # --- Stage 2: Filtering and Completion (Preview Generation) ---
+        except Exception as e:
+            log_callback(f"处理失败: {e}")
+            import traceback
+            log_callback(traceback.format_exc())
+            return False
+
+    def _export_full_processed_data(self, output_dir, log_callback=print):
+        """导出全量处理后的数据 (内部调用)"""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        log_callback(f"正在导出全量数据至: {output_dir}")
+        
+        # 构造文件名 (区分全量)
+        link_shp_path = os.path.join(output_dir, "link_processed_full.shp")
+        node_shp_path = os.path.join(output_dir, "node_processed_full.shp")
+        link_excel_path = os.path.join(output_dir, "link_processed_full.xlsx")
+        node_excel_path = os.path.join(output_dir, "node_processed_full.xlsx")
+
+        if self.processed_links_gdf is not None:
+            self.processed_links_gdf.to_file(link_shp_path, encoding='gbk')
+            # Excel 导出需要去掉 geometry 对象或转为 string
+            df_export = pd.DataFrame(self.processed_links_gdf.drop(columns='geometry'))
+            df_export['geometry'] = self.processed_links_gdf['geometry'].apply(lambda x: x.wkt)
+            df_export.to_excel(link_excel_path, index=False)
+
+        if self.processed_nodes_gdf is not None:
+            self.processed_nodes_gdf.to_file(node_shp_path, encoding='gbk')
+            df_export = pd.DataFrame(self.processed_nodes_gdf.drop(columns='geometry'))
+            df_export['geometry'] = self.processed_nodes_gdf['geometry'].apply(lambda x: x.wkt)
+            df_export.to_excel(node_excel_path, index=False)
+
+    # --- Stage 2: Filtering (Preview Generation) ---
     def generate_preview_data(self, filter_criteria, log_callback=print):
         """
-        根据筛选条件生成预览数据，并保存到 preview 变量中。
-        不会修改 self.links_df 和 self.nodes_df，而是基于 self.source_* 生成。
+        根据筛选条件 (区块ID列表) 从全量 processed 数据中筛选出预览数据。
         """
-        log_callback("正在生成预览数据...")
+        log_callback("正在生成预览数据 (基于全量处理结果筛选)...")
         
-        if self.source_links_df is None or self.source_nodes_df is None:
-             raise ValueError("请先运行预处理。")
+        if self.processed_links_gdf is None or self.processed_nodes_gdf is None:
+             raise ValueError("请先运行全流程处理 (步骤1)。")
 
-        # 使用 source 数据的副本进行操作
-        temp_links_df = self.source_links_df.copy()
-        temp_nodes_df = self.source_nodes_df.copy()
-        
-        log_callback(f"步骤 1/3: 保留区块: {filter_criteria}...")
-        temp_links_df = temp_links_df[temp_links_df['区块ID'].isin(filter_criteria)]
-        temp_nodes_df = temp_nodes_df[temp_nodes_df['区块ID'].isin(filter_criteria)]
-        
-        log_callback("步骤 2/3: 补全路段...")
-        temp_links_df = self._complete_links(temp_links_df, temp_nodes_df, log_callback)
-        
-        log_callback("步骤 3/3: 移除重复路段...")
-        temp_links_df = self._remove_duplicate_links(temp_links_df, log_callback)
-        
-        # 转换为 GeoDataFrame 并保存到 preview 变量
-        log_callback("正在转换为 GeoDataFrame...")
         try:
-            if 'geometry' in temp_links_df.columns:
-                 # 确保 geometry 列是字符串或 WKT 对象
-                temp_links_df['geometry'] = temp_links_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
-                self.preview_links_gdf = gpd.GeoDataFrame(temp_links_df, geometry='geometry')
-                # 为预览数据设置默认坐标参考系为 WGS84
-                if self.preview_links_gdf.crs is None:
-                    self.preview_links_gdf.set_crs(epsg=4326, inplace=True)
+            # 筛选 Links
+            log_callback(f"筛选区块: {filter_criteria}")
+            self.preview_links_gdf = self.processed_links_gdf[self.processed_links_gdf['区块ID'].isin(filter_criteria)].copy()
             
-            if 'geometry' in temp_nodes_df.columns:
-                temp_nodes_df['geometry'] = temp_nodes_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
-                self.preview_nodes_gdf = gpd.GeoDataFrame(temp_nodes_df, geometry='geometry')
-                if self.preview_nodes_gdf.crs is None:
-                    self.preview_nodes_gdf.set_crs(epsg=4326, inplace=True)
-                
-            log_callback("预览数据生成成功！")
+            # 筛选 Nodes
+            self.preview_nodes_gdf = self.processed_nodes_gdf[self.processed_nodes_gdf['区块ID'].isin(filter_criteria)].copy()
+            
+            log_callback(f"筛选完成: {len(self.preview_links_gdf)} 路段, {len(self.preview_nodes_gdf)} 节点")
             return True
         except Exception as e:
-            log_callback(f"转换 GeoDataFrame 失败: {e}")
+            log_callback(f"筛选失败: {e}")
             import traceback
             log_callback(traceback.format_exc())
             return False
 
     def export_preview_data(self, output_dir, log_callback=print):
-        """导出当前预览数据"""
+        """导出当前筛选后的预览数据"""
         if self.preview_links_gdf is None or self.preview_nodes_gdf is None:
             raise ValueError("没有可导出的预览数据，请先生成预览。")
             
-        # 将 GeoDataFrame 转回 DataFrame 以便复用 export_results 逻辑 (或直接导出)
-        # 这里为了保持一致性，我们把 geometry 列转回 WKT 字符串给 export_results 使用 (如果它需要)
-        # 但 export_results 内部又会转回 geometry...
-        # 简单起见，我们直接用 GeoDataFrame 导出 SHP，用 pd.DataFrame 导出 Excel
-        
-        log_callback("开始导出预览数据...")
+        log_callback("开始导出筛选后的数据...")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
             
-        link_excel_path = os.path.join(output_dir, "link_processed.xlsx")
-        node_excel_path = os.path.join(output_dir, "node_processed.xlsx")
-        link_shp_path = os.path.join(output_dir, "link_processed.shp")
-        node_shp_path = os.path.join(output_dir, "node_processed.shp")
+        # 导出文件名 (筛选版)
+        link_excel_path = os.path.join(output_dir, "link_filtered.xlsx")
+        node_excel_path = os.path.join(output_dir, "node_filtered.xlsx")
+        link_shp_path = os.path.join(output_dir, "link_filtered.shp")
+        node_shp_path = os.path.join(output_dir, "node_filtered.shp")
         
-        # 导出 Excel (去掉 geometry 列如果它是对象)
-        links_df_export = pd.DataFrame(self.preview_links_gdf.drop(columns='geometry'))
-        # 把 geometry 加回来作为字符串
-        links_df_export['geometry'] = self.preview_links_gdf['geometry'].apply(lambda x: x.wkt)
-        
-        nodes_df_export = pd.DataFrame(self.preview_nodes_gdf.drop(columns='geometry'))
-        nodes_df_export['geometry'] = self.preview_nodes_gdf['geometry'].apply(lambda x: x.wkt)
-
+        # 导出 Link
         log_callback(f"正在写入: {os.path.basename(link_excel_path)}")
+        links_df_export = pd.DataFrame(self.preview_links_gdf.drop(columns='geometry'))
+        links_df_export['geometry'] = self.preview_links_gdf['geometry'].apply(lambda x: x.wkt)
         links_df_export.to_excel(link_excel_path, index=False)
-        
-        log_callback(f"正在写入: {os.path.basename(node_excel_path)}")
-        nodes_df_export.to_excel(node_excel_path, index=False)
         
         log_callback(f"正在生成: {os.path.basename(link_shp_path)}")
         self.preview_links_gdf.to_file(link_shp_path, encoding='gbk')
         
-        log_callback(f"正在生成: {os.path.basename(node_shp_path)}")
+        # 导出 Node
+        log_callback(f"正在写入: {os.path.basename(node_excel_path)}")
+        nodes_df_export = pd.DataFrame(self.preview_nodes_gdf.drop(columns='geometry'))
+        nodes_df_export['geometry'] = self.preview_nodes_gdf['geometry'].apply(lambda x: x.wkt)
+        nodes_df_export.to_excel(node_excel_path, index=False)
         self.preview_nodes_gdf.to_file(node_shp_path, encoding='gbk')
         
         log_callback(f"文件已保存至: {output_dir}")
         return output_dir
 
-    # 兼容旧接口
-    def run_filtering_and_completion(self, filter_criteria, log_callback=print):
-        # 这个方法现在可以调用 generate_preview_data，然后更新 self.links_df 以保持向后兼容
-        # 但为了清晰，我们假设外部现在应该使用 generate_preview_data
-        # 如果必须保留这个方法给 WorkerThread 调用...
-        
-        success = self.generate_preview_data(filter_criteria, log_callback)
-        if success:
-            # 更新 self.links_df 以供可能的后续使用 (虽然现在主要用 preview_gdf)
-            # 注意：这里我们把 gdf 转回 df
-            self.links_df = pd.DataFrame(self.preview_links_gdf)
-            self.nodes_df = pd.DataFrame(self.preview_nodes_gdf)
-            # geometry 列现在是对象，如果后续代码期望字符串，可能需要转换，但 DataProcessor 内部应该能处理
-            return self.links_df, self.nodes_df
-        else:
-            raise Exception("生成数据失败")
+    # 兼容旧接口 (保留 run_preprocessing 但指向新逻辑，或者在 GUI 中修改调用)
+    # 为了清晰，建议在 GUI 中改为调用 run_full_processing
+    # 下面保留 run_preprocessing 作为别名或部分兼容，但建议 GUI 更新
+    def run_preprocessing(self, *args, **kwargs):
+        # 这是一个兼容性包装，如果 GUI 还没改
+        # 但参数签名变了 (多了 output_dir)，所以最好直接改 GUI
+        pass
 
     # --- Private Helper Methods for Stage 1 ---
     def _read_mapping_files(self, node_map_path, link_map_path, attr_map_path, log_callback=print):

@@ -29,50 +29,126 @@ class DataProcessor:
         self.block_stats_df = None
         self.mapping_files = {}
 
+    def update_mappings(self, node_map_df, link_map_df, attr_map_df):
+        """
+        更新内存中的映射配置。
+        接收 pandas DataFrame 格式的映射表。
+        """
+        try:
+            # 清理列名空格
+            link_map_df.columns = link_map_df.columns.str.strip()
+            node_map_df.columns = node_map_df.columns.str.strip()
+            attr_map_df.columns = attr_map_df.columns.str.strip()
+
+            # ------------------------------------------------------------------
+            # Link 表头映射处理
+            # ------------------------------------------------------------------
+            # 必须包含 'OSM表头' 和 '中文表头'
+            if 'OSM表头' not in link_map_df.columns:
+                 # 尝试自动推断或报错，这里假设第一列是OSM，第二列是中文
+                 pass 
+
+            # 1. 以 OSM表头 为索引 (用于筛选和重命名 OSM 数据)
+            link_osm_index = link_map_df.set_index('OSM表头', drop=False)
+            
+            # 2. 以 属性/属性名称 为索引 (用于查找字段名)
+            link_attr_col = '属性'
+            if link_attr_col in link_map_df.columns:
+                # 去除属性列的空格
+                link_map_df[link_attr_col] = link_map_df[link_attr_col].astype(str).str.strip()
+                link_attr_index = link_map_df.set_index(link_attr_col, drop=False)
+            else:
+                link_attr_index = None
+
+            # ------------------------------------------------------------------
+            # Node 表头映射处理
+            # ------------------------------------------------------------------
+            node_osm_index = node_map_df.set_index('OSM表头', drop=False)
+            
+            node_attr_col = '属性' if '属性' in node_map_df.columns else '属性名称'
+            if node_attr_col in node_map_df.columns:
+                node_map_df[node_attr_col] = node_map_df[node_attr_col].astype(str).str.strip()
+                node_attr_index = node_map_df.set_index(node_attr_col, drop=False)
+            else:
+                node_attr_index = None
+
+            # ------------------------------------------------------------------
+            # 属性映射处理 (Road Level + Channel -> Attributes)
+            # ------------------------------------------------------------------
+            # 假设前两列是索引 (道路等级, is_link/渠道)
+            # 按照 Notebook 逻辑: pd.read_excel(..., index_col=[0, 1])
+            # 这里我们手动设置 index
+            attr_cols = list(attr_map_df.columns)
+            if len(attr_cols) >= 2:
+                # 确保索引列没有空格
+                attr_map_df[attr_cols[0]] = attr_map_df[attr_cols[0]].astype(str).str.strip()
+                # 第二列通常是 0/1 (is_link)，保持原样或转int
+                attr_map = attr_map_df.set_index([attr_cols[0], attr_cols[1]])
+            else:
+                attr_map = attr_map_df # Fallback
+
+            self.mapping_files = {
+                'link_osm_index': link_osm_index,
+                'link_attr_index': link_attr_index,
+                'node_osm_index': node_osm_index,
+                'node_attr_index': node_attr_index,
+                'attr_map': attr_map
+            }
+            return True
+        except Exception as e:
+            print(f"Error updating mappings: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     # --- Stage 1: Full Processing (Preprocessing + Completion + Deduplication) ---
-    def run_full_processing(self, links_df, nodes_df, node_map_path, link_map_path, attr_map_path, output_dir, log_callback=print):
+    def run_full_processing(self, links_df, nodes_df, log_callback=print):
         """
         执行全流程处理：
-        1. 读取映射文件
+        1. 检查映射文件 (已预先加载)
         2. 预处理 Link/Node (表头、属性)
         3. 连通性分析 (计算 Block ID)
         4. 路段补全 (针对全量数据)
         5. 移除重复路段 (针对全量数据)
         6. 生成 GeoDataFrame 并保存为类变量
-        7. 导出全量处理结果到 output_dir
         """
         self.links_df = links_df.copy()
         self.nodes_df = nodes_df.copy()
         
-        # 1. 读取映射
-        log_callback("步骤 1/6: 读取映射文件...")
-        self._read_mapping_files(node_map_path, link_map_path, attr_map_path, log_callback)
-        
+        # 1. 检查映射
+        if not self.mapping_files:
+            log_callback("错误: 映射关系未加载，请先在参数配置页点击'应用'。")
+            raise ValueError("Mappings not loaded")
+            
         # 2. 预处理
-        log_callback("步骤 2/6: 处理Link数据...")
+        log_callback("步骤 1/5: 处理Link数据...")
         self._process_link_headers(log_callback)
         self._process_link_attributes(log_callback)
         
-        log_callback("步骤 3/6: 处理Node数据...")
+        log_callback("步骤 2/5: 处理Node数据...")
         self._process_node_headers(log_callback)
         
         # 3. 连通性分析
-        log_callback("步骤 4/6: 检查区块连通性...")
+        log_callback("步骤 3/5: 检查区块连通性...")
         self._check_blocks(log_callback)
         
-        # 备份原始处理结果 (含 Block ID, 但未补全/去重)
-        self.source_links_df = self.links_df.copy()
-        self.source_nodes_df = self.nodes_df.copy()
-        
         # 4. 路段补全 (全量)
-        log_callback("步骤 5/6: 全量路段补全与去重...")
+        log_callback("步骤 4/5: 全量路段补全与去重...")
         self.links_df = self._complete_links(self.links_df, self.nodes_df, log_callback)
         
         # 5. 移除重复 (全量)
         self.links_df = self._remove_duplicate_links(self.links_df, log_callback)
+
+        # 重新计算区块统计信息 (在补全和去重之后)
+        log_callback("更新区块统计信息...")
+        self._update_block_stats(log_callback)
+        
+        # 备份原始处理结果 (含 Block ID, 补全, 去重)
+        self.source_links_df = self.links_df.copy()
+        self.source_nodes_df = self.nodes_df.copy()
         
         # 6. 生成 GeoDataFrame
-        log_callback("步骤 6/6: 生成全量 GeoDataFrame...")
+        log_callback("步骤 5/5: 生成全量 GeoDataFrame...")
         try:
             # 处理 Link Geometry
             if 'geometry' in self.links_df.columns:
@@ -88,10 +164,7 @@ class DataProcessor:
                 if self.processed_nodes_gdf.crs is None:
                     self.processed_nodes_gdf.set_crs(epsg=4326, inplace=True)
             
-            # 7. 自动导出全量数据
-            self._export_full_processed_data(output_dir, log_callback)
-            
-            log_callback("全量数据处理与导出完成！")
+            log_callback("全量数据处理完成 (已缓存，请前往筛选页导出)！")
             return True
 
         except Exception as e:
@@ -101,30 +174,8 @@ class DataProcessor:
             return False
 
     def _export_full_processed_data(self, output_dir, log_callback=print):
-        """导出全量处理后的数据 (内部调用)"""
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            
-        log_callback(f"正在导出全量数据至: {output_dir}")
-        
-        # 构造文件名 (区分全量)
-        link_shp_path = os.path.join(output_dir, "link_processed_full.shp")
-        node_shp_path = os.path.join(output_dir, "node_processed_full.shp")
-        link_excel_path = os.path.join(output_dir, "link_processed_full.xlsx")
-        node_excel_path = os.path.join(output_dir, "node_processed_full.xlsx")
-
-        if self.processed_links_gdf is not None:
-            self.processed_links_gdf.to_file(link_shp_path, encoding='gbk')
-            # Excel 导出需要去掉 geometry 对象或转为 string
-            df_export = pd.DataFrame(self.processed_links_gdf.drop(columns='geometry'))
-            df_export['geometry'] = self.processed_links_gdf['geometry'].apply(lambda x: x.wkt)
-            df_export.to_excel(link_excel_path, index=False)
-
-        if self.processed_nodes_gdf is not None:
-            self.processed_nodes_gdf.to_file(node_shp_path, encoding='gbk')
-            df_export = pd.DataFrame(self.processed_nodes_gdf.drop(columns='geometry'))
-            df_export['geometry'] = self.processed_nodes_gdf['geometry'].apply(lambda x: x.wkt)
-            df_export.to_excel(node_excel_path, index=False)
+        # Deprecated: Export logic moved to export_preview_data
+        pass
 
     # --- Stage 2: Filtering (Preview Generation) ---
     def generate_preview_data(self, filter_criteria, log_callback=print):
@@ -152,20 +203,20 @@ class DataProcessor:
             log_callback(traceback.format_exc())
             return False
 
-    def export_preview_data(self, output_dir, log_callback=print):
+    def export_preview_data(self, output_dir, encoding='gbk', log_callback=print):
         """导出当前筛选后的预览数据"""
         if self.preview_links_gdf is None or self.preview_nodes_gdf is None:
             raise ValueError("没有可导出的预览数据，请先生成预览。")
             
-        log_callback("开始导出筛选后的数据...")
+        log_callback(f"开始导出筛选后的数据 (编码: {encoding})...")
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
             
         # 导出文件名 (筛选版)
-        link_excel_path = os.path.join(output_dir, "link_filtered.xlsx")
-        node_excel_path = os.path.join(output_dir, "node_filtered.xlsx")
-        link_shp_path = os.path.join(output_dir, "link_filtered.shp")
-        node_shp_path = os.path.join(output_dir, "node_filtered.shp")
+        link_excel_path = os.path.join(output_dir, "link_processed.xlsx")
+        node_excel_path = os.path.join(output_dir, "node_processed.xlsx")
+        link_shp_path = os.path.join(output_dir, "link_processed.shp")
+        node_shp_path = os.path.join(output_dir, "node_processed.shp")
         
         # 导出 Link
         log_callback(f"正在写入: {os.path.basename(link_excel_path)}")
@@ -174,205 +225,356 @@ class DataProcessor:
         links_df_export.to_excel(link_excel_path, index=False)
         
         log_callback(f"正在生成: {os.path.basename(link_shp_path)}")
-        self.preview_links_gdf.to_file(link_shp_path, encoding='gbk')
+        self.preview_links_gdf.to_file(link_shp_path, encoding=encoding)
         
         # 导出 Node
         log_callback(f"正在写入: {os.path.basename(node_excel_path)}")
         nodes_df_export = pd.DataFrame(self.preview_nodes_gdf.drop(columns='geometry'))
         nodes_df_export['geometry'] = self.preview_nodes_gdf['geometry'].apply(lambda x: x.wkt)
         nodes_df_export.to_excel(node_excel_path, index=False)
-        self.preview_nodes_gdf.to_file(node_shp_path, encoding='gbk')
+        self.preview_nodes_gdf.to_file(node_shp_path, encoding=encoding)
         
         log_callback(f"文件已保存至: {output_dir}")
         return output_dir
 
-    # 兼容旧接口 (保留 run_preprocessing 但指向新逻辑，或者在 GUI 中修改调用)
-    # 为了清晰，建议在 GUI 中改为调用 run_full_processing
-    # 下面保留 run_preprocessing 作为别名或部分兼容，但建议 GUI 更新
+    # 兼容旧接口
     def run_preprocessing(self, *args, **kwargs):
-        # 这是一个兼容性包装，如果 GUI 还没改
-        # 但参数签名变了 (多了 output_dir)，所以最好直接改 GUI
         pass
 
-    # --- Private Helper Methods for Stage 1 ---
     def _read_mapping_files(self, node_map_path, link_map_path, attr_map_path, log_callback=print):
         log_callback("  读取中...")
         # Link 表头映射
-        link_title_raw = pd.read_excel(link_map_path, index_col=0)
-        link_title_map = link_title_raw.set_index('OSM表头')
+        link_df = pd.read_excel(link_map_path)
         # Node 表头映射
-        node_title_raw = pd.read_excel(node_map_path, index_col=0)
-        node_title_map = node_title_raw.set_index('OSM表头')
+        node_df = pd.read_excel(node_map_path)
         # 属性映射
-        attr_map = pd.read_excel(attr_map_path, index_col=[0, 1])
+        attr_df = pd.read_excel(attr_map_path)
 
-        self.mapping_files = {
-            'link_map': link_title_map,
-            'link_map_raw': link_title_raw,
-            'node_map': node_title_map,
-            'node_map_raw': node_title_raw,
-            'attr_map': attr_map
-        }
+        self.update_mappings(node_df, link_df, attr_df)
 
-    def _get_chn_title(self, name, map_type='link'):
-        """获取指定原始表头对应的中文表头名"""
-        raw_map = self.mapping_files.get(f'{map_type}_map_raw')
-        if raw_map is not None:
-            # 检查 name 是否在索引中
-            if name in raw_map.index:
-                return raw_map.loc[name, '中文表头']
-        # 如果没找到，返回 None 或者 name 本身? 最好返回 None 以便调用者处理
-        return None
+    def _get_column_name(self, attribute, map_type='link', target='chn'):
+        """
+        统一的列名获取函数 (对应 Notebook 中的 getRoadChnTit 等)。
         
-    def get_chn_title_public(self, name, map_type='link'):
-        """公开的获取中文表头方法"""
-        return self._get_chn_title(name, map_type)
+        Args:
+            attribute (str): 属性名称 (如 '道路等级', '机动车道数')
+            map_type (str): 'link' 或 'node'
+            target (str): 'chn' (中文表头) 或 'osm' (OSM表头)
+        
+        Returns:
+            str: 对应的表头名称。如果找不到且 target='chn'，返回 attribute 本身。
+        """
+        # 1. 获取对应的索引表
+        index_key = f'{map_type}_attr_index'
+        mapping_df = self.mapping_files.get(index_key)
+        
+        if mapping_df is None:
+            return attribute if target == 'chn' else None
+            
+        # 2. 查找
+        if attribute in mapping_df.index:
+            col_name = '中文表头' if target == 'chn' else 'OSM表头'
+            val = mapping_df.loc[attribute, col_name]
+            
+            # 处理 Series (如果有重复索引) - 取第一个
+            if isinstance(val, pd.Series):
+                val = val.iloc[0]
+                
+            if pd.isna(val) or val == '':
+                return attribute if target == 'chn' else None
+            return val
+            
+        # 3. Fallback
+        return attribute if target == 'chn' else None
+
+
+    # 兼容旧代码的 helper
+    def _get_chn_title(self, name, map_type='link'):
+        return self._get_column_name(name, map_type, 'chn')
+        
+    def _get_osm_title(self, name, map_type='link'):
+        return self._get_column_name(name, map_type, 'osm')
 
     def _process_link_headers(self, log_callback=print):
         log_callback("  替换Link表头...")
-        link_map = self.mapping_files['link_map']
+        link_map_index = self.mapping_files.get('link_osm_index')
+        if link_map_index is None:
+            return
+
         original_links = self.links_df.copy()
 
-        # 保留有用的列
-        valid_cols = link_map[link_map.index.notnull() & link_map['中文表头'].notnull()].index.tolist()
-        self.links_df = self.links_df[[col for col in valid_cols if col in self.links_df.columns]]
+        # 1. 保留有用的列 (OSM表头存在于映射文件中)
+        # 筛选条件: OSM表头不为空 & 中文表头不为空
+        # 使用 boolean indexing 直接筛选 DataFrame 行
+        valid_rows = link_map_index[link_map_index.index.notnull() & link_map_index['中文表头'].notnull()]
+        valid_osm_cols = valid_rows.index.tolist()
+        
+        # 只保留存在于原始数据中的列
+        existing_cols = [col for col in valid_osm_cols if col in self.links_df.columns]
+        
+        self.links_df = self.links_df[[col for col in existing_cols]]
 
-        # 替换为中文表头
-        self.links_df.columns = link_map.loc[self.links_df.columns, '中文表头'].tolist()
+        # 2. 替换为中文表头
+        # map() 可能会有性能问题如果 index 不唯一，但这里应该是唯一的
+        new_columns = link_map_index.loc[self.links_df.columns, '中文表头'].tolist()
+        self.links_df.columns = new_columns
 
-        # 添加原本没有的列
-        missing_cols = link_map[link_map.index.isnull()]['中文表头'].tolist()
-        self.links_df.loc[:, missing_cols] = 1.0
+        # 3. 补充属性 (OSM映射文件中，OSM表头为空的行，对应的中文表头)
+        # 这些通常是后续计算需要的空白列或固定值列
+        missing_osm_rows = link_map_index[link_map_index.index.isnull()]
+        if not missing_osm_rows.empty:
+            missing_chn_cols = missing_osm_rows['中文表头'].dropna().tolist()
+            for col in missing_chn_cols:
+                self.links_df[col] = 1.0 # 按照 Notebook 逻辑填充 1.0
 
-        # 添加后续判断需要的列 (例如 is_link)
-        if 'is_link' in original_links.columns:
-            self.links_df.loc[:, 'is_link'] = original_links['is_link']
+        # 4. 添加后续用于进行判断但不在中文表头中的属性 (如 is_link -> 渠道)
+        # Notebook: RoadTSTitCsv.loc[:, 'is_link'] = roadOSMCSV['is_link']
+        # 我们需要找到 '渠道' 对应的 中文列名，以及 '渠道' 对应的 原始OSM表头
+        channel_chn_col = self._get_column_name('渠道', 'link', 'chn')
+        channel_osm_col = self._get_column_name('渠道', 'link', 'osm')
+        
+        # 如果获取到了原始数据的 OSM 表头名
+        if channel_osm_col and channel_osm_col in original_links.columns and channel_chn_col:
+             self.links_df[channel_chn_col] = original_links[channel_osm_col]
 
     def _process_link_attributes(self, log_callback=print):
         log_callback("  更新/填充Link属性...")
-        attr_map = self.mapping_files['attr_map']
-        road_level_col = self._get_chn_title('道路等级')
-        lanes_col = self._get_chn_title('机动车道数')
-        lane_width_col = self._get_chn_title('机动车道宽度')
-        sep_col = self._get_chn_title('机非分隔')
-        non_motor_width_col = self._get_chn_title('非机动车道宽度')
-        name_col = self._get_chn_title('道路名称')
-        from_node_col = self._get_chn_title('起点')
-        to_node_col = self._get_chn_title('终点')
+        attr_map = self.mapping_files.get('attr_map')
+        if attr_map is None:
+            return
 
-        # 筛选掉无效的道路等级
-        valid_levels = attr_map.index.levels[0]
-        self.links_df = self.links_df[self.links_df[road_level_col].isin(valid_levels)]
-
-        road_index = self.links_df[[road_level_col, 'is_link']].values.tolist()
+        # 获取各属性对应的中文列名
+        road_level_col = self._get_column_name('道路等级', 'link', 'chn')
+        channel_col = self._get_column_name('渠道', 'link', 'chn')
         
-        # 替换车道数 (仅当为空时)
-        lanes_null_mask = self.links_df[lanes_col].isnull()
-        if lanes_null_mask.any():
-            lane_null_road_index = self.links_df.loc[lanes_null_mask, [road_level_col, 'is_link']].values.tolist()
-            self.links_df.loc[lanes_null_mask, lanes_col] = attr_map.loc[lane_null_road_index, '机动车道数'].tolist()
+        # 属性列 (目标列)
+        width_col = self._get_column_name('机动车道宽度', 'link', 'chn')
+        sep_col = self._get_column_name('机非分隔', 'link', 'chn')
+        nm_width_col = self._get_column_name('非机动车道宽度', 'link', 'chn')
+        lanes_col = self._get_column_name('机动车道数', 'link', 'chn')
+        name_col = self._get_column_name('道路名称', 'link', 'chn')
+        from_col = self._get_column_name('起点', 'link', 'chn')
+        to_col = self._get_column_name('终点', 'link', 'chn')
 
-        # 批量替换属性
-        self.links_df[lane_width_col] = attr_map.loc[road_index, '机动车道宽度'].tolist()
-        self.links_df[sep_col] = attr_map.loc[road_index, '机非分隔'].tolist()
-        self.links_df[non_motor_width_col] = attr_map.loc[road_index, '非机动车道宽度'].tolist()
-        self.links_df[road_level_col] = attr_map.loc[road_index, '道路等级Num'].tolist()
+        # 1. 筛选有效道路等级
+        # 假设 attr_map 的 index level 0 是道路等级
+        if road_level_col in self.links_df.columns:
+            valid_levels = attr_map.index.levels[0].tolist()
+            # 确保类型一致 (通常是 str)
+            self.links_df = self.links_df[self.links_df[road_level_col].isin(valid_levels)]
+        else:
+            log_callback(f"警告: 找不到 '{road_level_col}' 列，无法筛选道路等级。")
+            return
 
-        # 补全道路名称
-        name_null_mask = self.links_df[name_col].isnull()
-        self.links_df.loc[name_null_mask, name_col] = pd.Series(self.links_df[name_null_mask].index).apply(lambda r: f"{r}路").tolist()
-
-        # 更新数据类型
-        for col, dtype in {
-            from_node_col: int, to_node_col: int, lanes_col: int,
-            non_motor_width_col: int, sep_col: int, road_level_col: int
-        }.items():
-            if col in self.links_df.columns:
-                self.links_df[col] = self.links_df[col].astype(dtype)
+        # 2. 准备索引 (道路等级, 渠道)
+        # 确保 channel_col 存在
+        if channel_col not in self.links_df.columns:
+             log_callback("警告: 找不到渠道/is_link列，默认设为0")
+             self.links_df[channel_col] = 0
         
-        # 按最终顺序排列
-        final_cols = self.mapping_files['link_map_raw'][~self.mapping_files['link_map_raw']['中文表头'].isnull()]['中文表头']
-        self.links_df = self.links_df[[col for col in final_cols if col in self.links_df.columns]]
+        # 3. 批量更新属性 (基于 Notebook 逻辑)
+        try:
+            # 获取属性映射表的列名
+            attr_cols = attr_map.columns.tolist()
+            
+            # 构造索引元组
+            # 确保类型匹配：道路等级(str), 渠道(int)
+            self.links_df[road_level_col] = self.links_df[road_level_col].astype(str)
+            self.links_df[channel_col] = self.links_df[channel_col].astype(int)
+            
+            # 使用列表推导式构造 (level, channel) 元组
+            road_index = self.links_df[[road_level_col, channel_col]].values.tolist()
+            
+            # 批量获取属性值并更新
+            # 注意：如果 road_index 中的某个元组不在 attr_map.index 中，loc 会报错
+            # 我们需要先过滤或使用 reindex
+            
+            # 为了严谨且简单，我们先获取 attr_map 中存在的索引
+            valid_attr_map = attr_map[~attr_map.index.duplicated(keep='first')]
+            print(attr_map)
+            print(valid_attr_map.index)
+            # 直接使用 loc 获取 (可能会有缺失，缺失的会返回 NaN)
+            # 使用 reindex 是最安全且最接近 Notebook 逻辑的方式
+            matched_attrs = valid_attr_map.loc[road_index,:]
+            print(matched_attrs)
+            # 更新各列
+            if width_col and '机动车道宽度' in attr_cols:
+                self.links_df[width_col] = matched_attrs['机动车道宽度'].values
+
+            if sep_col and '机非分隔' in attr_cols:
+                self.links_df[sep_col] = matched_attrs['机非分隔'].values
+                
+            if nm_width_col and '非机动车道宽度' in attr_cols:
+                self.links_df[nm_width_col] = matched_attrs['非机动车道宽度'].values
+            
+            if lanes_col and '机动车道数' in attr_cols:
+                self.links_df[lanes_col] = matched_attrs['机动车道数'].values
+
+            if road_level_col and '道路等级Num' in attr_cols:
+                # 只有匹配成功的部分才更新等级为数字，否则保留原等级？
+                # Notebook 逻辑是直接赋值。
+                self.links_df[road_level_col] = matched_attrs['道路等级Num'].values
+
+        except Exception as e:
+            log_callback(f"警告: 更新属性时出错: {e}")
+            import traceback
+            log_callback(traceback.format_exc())
+
+        # 4. 补全道路名称
+
+        # 4. 补全道路名称
+        if name_col in self.links_df.columns:
+            name_null_mask = self.links_df[name_col].isnull()
+            if name_null_mask.any():
+                # 使用 index + '路'
+                self.links_df.loc[name_null_mask, name_col] = pd.Series(self.links_df[name_null_mask].index).apply(lambda r: f"{r}路").tolist()
+
+        # 5. 类型转换 (astype int)
+        cols_to_int = [from_col, to_col, lanes_col, nm_width_col, sep_col, road_level_col]
+        for col in cols_to_int:
+            if col and col in self.links_df.columns:
+                try:
+                    self.links_df[col] = self.links_df[col].fillna(0).astype(int)
+                except:
+                    pass
+
+        # 6. 按最终顺序排列
+        # 从 link_map_raw 中获取所有 中文表头 (非空)
+        link_map_raw = self.mapping_files.get('link_osm_index') # 其实用 link_map_raw (osm index drop=False)
+        # 但是我们需要的是原始顺序吗？
+        # Notebook: RoadTSTitCsv (which has cols from mapping).
+        # 我们使用 link_map_index (sorted by OSM header?). No, original order in excel.
+        # 最好保持 Excel 中的顺序
+        if link_map_raw is not None:
+             final_cols = link_map_raw[link_map_raw['中文表头'].notnull()]['中文表头'].unique().tolist()
+             self.links_df = self.links_df[[c for c in final_cols if c in self.links_df.columns]]
 
     def _process_node_headers(self, log_callback=print):
         log_callback("  替换Node表头...")
-        node_map = self.mapping_files['node_map']
-        
+        node_map_index = self.mapping_files.get('node_osm_index')
+        if node_map_index is None:
+            return
+
         # 确保geometry列存在
         if 'geometry' not in self.nodes_df.columns and 'x_coord' in self.nodes_df.columns:
             self.nodes_df['geometry'] = self.nodes_df.apply(lambda r: f"POINT({r['x_coord']} {r['y_coord']})", axis=1)
 
-        # 保留并重命名列
-        valid_cols = node_map[node_map.index.notnull()].index.tolist()
-        self.nodes_df = self.nodes_df[[col for col in valid_cols if col in self.nodes_df.columns]]
-        self.nodes_df.columns = node_map.loc[self.nodes_df.columns, '中文表头'].tolist()
+        # 1. 筛选与重命名
+        # 筛选 OSM表头 不为空的行
+        valid_rows = node_map_index[node_map_index.index.notnull()]
+        valid_osm_cols = valid_rows.index.tolist()
+        
+        # 找到存在的列
+        existing_cols = [col for col in valid_osm_cols if col in self.nodes_df.columns]
+        
+        self.nodes_df = self.nodes_df[existing_cols]
+        self.nodes_df.columns = node_map_index.loc[self.nodes_df.columns, '中文表头'].tolist()
 
-        # 填充类型
-        type_col = self._get_chn_title('类型', 'node')
+        # 2. 填充默认类型
+        type_col = self._get_column_name('类型', 'node', 'chn')
         if type_col:
-            self.nodes_df.loc[:, type_col] = 2 # 默认为2
+            self.nodes_df[type_col] = 2 
 
     def _check_blocks(self, log_callback=print):
         log_callback("  使用 networkx 进行连通性分析...")
-        from_node_col = self._get_chn_title('起点')
-        to_node_col = self._get_chn_title('终点')
-        node_id_col = self._get_chn_title('编号', 'node')
+        from_col = self._get_column_name('起点', 'link', 'chn')
+        to_col = self._get_column_name('终点', 'link', 'chn')
+        node_id_col = self._get_column_name('编号', 'node', 'chn')
 
-        G = nx.from_pandas_edgelist(self.links_df, from_node_col, to_node_col, create_using=nx.Graph())
+        if not (from_col in self.links_df.columns and to_col in self.links_df.columns):
+            log_callback("错误: 找不到起点/终点列，无法检查连通性。")
+            return
+
+        G = nx.from_pandas_edgelist(self.links_df, from_col, to_col, create_using=nx.Graph())
         
         # 获取连通分量
         components = list(nx.connected_components(G))
         node_to_block = {node: i for i, comp in enumerate(components) for node in comp}
         
-        # 添加中文列名: 区块ID
+        # 添加区块ID
         self.nodes_df['区块ID'] = self.nodes_df[node_id_col].map(node_to_block)
-        self.links_df['区块ID'] = self.links_df[from_node_col].map(node_to_block)
+        self.links_df['区块ID'] = self.links_df[from_col].map(node_to_block)
 
-        # 计算出入度 (使用中文列名)
-        G_di = nx.from_pandas_edgelist(self.links_df, from_node_col, to_node_col, create_using=nx.DiGraph())
+        # 计算出入度
+        G_di = nx.from_pandas_edgelist(self.links_df, from_col, to_col, create_using=nx.DiGraph())
         in_degree = dict(G_di.in_degree())
         out_degree = dict(G_di.out_degree())
+        
         self.nodes_df['入度'] = self.nodes_df[node_id_col].map(in_degree).fillna(0).astype(int)
         self.nodes_df['出度'] = self.nodes_df[node_id_col].map(out_degree).fillna(0).astype(int)
         self.nodes_df['是否断头路'] = ((self.nodes_df['入度'] == 0) | (self.nodes_df['出度'] == 0)).astype(int)
 
-        # 生成统计信息 (使用中文列名)
+        # 统计
         block_link_counts = self.links_df.groupby('区块ID').size().rename('路段数')
         block_node_counts = self.nodes_df.groupby('区块ID').size().rename('节点数')
         stats_df = pd.concat([block_link_counts, block_node_counts], axis=1).reset_index()
 
-        # 确保数量为整数
         stats_df['路段数'] = stats_df['路段数'].fillna(0).astype(int)
         stats_df['节点数'] = stats_df['节点数'].fillna(0).astype(int)
-
-        # 计算占比
+        
         total_links = len(self.links_df)
         total_nodes = len(self.nodes_df)
-        stats_df['路段占比'] = (stats_df['路段数'] / total_links * 100).apply(lambda x: f"{x:.2f}%")
-        stats_df['节点占比'] = (stats_df['节点数'] / total_nodes * 100).apply(lambda x: f"{x:.2f}%")
+        if total_links > 0:
+            stats_df['路段占比'] = (stats_df['路段数'] / total_links * 100).apply(lambda x: f"{x:.2f}%")
+        else:
+            stats_df['路段占比'] = "0.00%"
+            
+        if total_nodes > 0:
+            stats_df['节点占比'] = (stats_df['节点数'] / total_nodes * 100).apply(lambda x: f"{x:.2f}%")
+        else:
+            stats_df['节点占比'] = "0.00%"
 
-        # 按最终顺序排列并赋值
         self.block_stats_df = stats_df[['区块ID', '路段数', '路段占比', '节点数', '节点占比']]
 
-    # --- Private Helper Methods for Stage 2 ---
-    def _filter_blocks(self, filter_criteria, log_callback=print):
-        # Deprecated: use generate_preview_data logic instead
-        pass
+    def _update_block_stats(self, log_callback=print):
+        """
+        更新区块统计信息 (在补全和去重后调用)
+        """
+        # 统计
+        if '区块ID' not in self.links_df.columns or '区块ID' not in self.nodes_df.columns:
+            return
+
+        block_link_counts = self.links_df.groupby('区块ID').size().rename('路段数')
+        block_node_counts = self.nodes_df.groupby('区块ID').size().rename('节点数')
+        stats_df = pd.concat([block_link_counts, block_node_counts], axis=1).reset_index()
+
+        stats_df['路段数'] = stats_df['路段数'].fillna(0).astype(int)
+        stats_df['节点数'] = stats_df['节点数'].fillna(0).astype(int)
+        
+        total_links = len(self.links_df)
+        total_nodes = len(self.nodes_df)
+        if total_links > 0:
+            stats_df['路段占比'] = (stats_df['路段数'] / total_links * 100).apply(lambda x: f"{x:.2f}%")
+        else:
+            stats_df['路段占比'] = "0.00%"
+            
+        if total_nodes > 0:
+            stats_df['节点占比'] = (stats_df['节点数'] / total_nodes * 100).apply(lambda x: f"{x:.2f}%")
+        else:
+            stats_df['节点占比'] = "0.00%"
+
+        self.block_stats_df = stats_df[['区块ID', '路段数', '路段占比', '节点数', '节点占比']]
 
     def _complete_links(self, links_df, nodes_df, log_callback=print):
         log_callback("  补全反向路段...")
-        dead_end_nodes = nodes_df[nodes_df['是否断头路'] == 1][self._get_chn_title('编号', 'node')]
+        node_id_col = self._get_column_name('编号', 'node', 'chn')
+        if '是否断头路' not in nodes_df.columns:
+            return links_df
+            
+        dead_end_nodes = nodes_df[nodes_df['是否断头路'] == 1][node_id_col]
         if dead_end_nodes.empty:
             return links_df
 
-        from_node_col = self._get_chn_title('起点')
-        to_node_col = self._get_chn_title('终点')
-        geom_col = self._get_chn_title('矢量数据', 'link')
+        from_col = self._get_column_name('起点', 'link', 'chn')
+        to_col = self._get_column_name('终点', 'link', 'chn')
+        geom_col = self._get_column_name('矢量数据', 'link', 'chn') # 通常是 'geometry'
+        if not geom_col or geom_col not in links_df.columns:
+            geom_col = 'geometry' # fallback
 
         # 找到所有与断头路节点相连的路段
         dead_end_links = links_df[
-            (links_df[from_node_col].isin(dead_end_nodes)) |
-            (links_df[to_node_col].isin(dead_end_nodes))
+            (links_df[from_col].isin(dead_end_nodes)) |
+            (links_df[to_col].isin(dead_end_nodes))
         ].copy()
 
         if dead_end_links.empty:
@@ -380,10 +582,18 @@ class DataProcessor:
 
         # 创建反向路段
         reversed_links = dead_end_links.copy()
-        reversed_links[from_node_col], reversed_links[to_node_col] = reversed_links[to_node_col], reversed_links[from_node_col]
-        reversed_links[geom_col] = reversed_links[geom_col].apply(self._reverse_geometry_string)
+        reversed_links[from_col], reversed_links[to_col] = reversed_links[to_col], reversed_links[from_col]
+        
+        if geom_col in reversed_links.columns:
+            reversed_links[geom_col] = reversed_links[geom_col].apply(self._reverse_geometry_string)
         
         return pd.concat([links_df, reversed_links], ignore_index=True)
+
+    def _remove_duplicate_links(self, links_df, log_callback=print):
+        log_callback("  移除重复路段...")
+        from_col = self._get_column_name('起点', 'link', 'chn')
+        to_col = self._get_column_name('终点', 'link', 'chn')
+        return links_df.drop_duplicates(subset=[from_col, to_col], keep='first')
 
     def _reverse_geometry_string(self, geometry_str):
         if not isinstance(geometry_str, str) or not geometry_str.upper().startswith('LINESTRING'):
@@ -397,19 +607,13 @@ class DataProcessor:
         except Exception:
             return geometry_str # 如果解析失败，返回原字符串
 
-    def _remove_duplicate_links(self, links_df, log_callback=print):
-        log_callback("  移除重复路段...")
-        from_node_col = self._get_chn_title('起点')
-        to_node_col = self._get_chn_title('终点')
-        return links_df.drop_duplicates(subset=[from_node_col, to_node_col], keep='first')
-
 # ==============================================================================
 # 文件导出辅助函数 (Export Helper Functions)
 # ==============================================================================
 
-def export_results(links_df, nodes_df, output_dir, is_raw=False, log_callback=print):
+def export_results(links_df, nodes_df, output_dir, is_raw=False, encoding='gbk', log_callback=print):
     """将最终的DataFrame导出为Excel和Shapefile。"""
-    log_callback("  开始导出文件...")
+    log_callback(f"  开始导出文件 (编码: {encoding})...")
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         
@@ -424,13 +628,13 @@ def export_results(links_df, nodes_df, output_dir, is_raw=False, log_callback=pr
     log_callback(f"    正在写入: {os.path.basename(node_excel_path)}")
     nodes_df.to_excel(node_excel_path, index=False)
     
-    _create_link_shp(links_df.copy(), link_shp_path, log_callback)
-    _create_node_shp(nodes_df.copy(), node_shp_path, log_callback)
+    _create_link_shp(links_df.copy(), link_shp_path, encoding, log_callback)
+    _create_node_shp(nodes_df.copy(), node_shp_path, encoding, log_callback)
     
     log_callback(f"  文件已保存至: {output_dir}")
     return output_dir
 
-def _create_link_shp(links_df, path, log_callback=print):
+def _create_link_shp(links_df, path, encoding, log_callback=print):
     """从Link DataFrame创建并保存Shapefile。"""
     log_callback(f"    正在生成: {os.path.basename(path)}")
     if 'geometry' not in links_df.columns or links_df['geometry'].isnull().all():
@@ -442,11 +646,11 @@ def _create_link_shp(links_df, path, log_callback=print):
              links_df['geometry'] = links_df['geometry'].apply(wkt.loads)
              
         gdf = gpd.GeoDataFrame(links_df, geometry='geometry')
-        gdf.to_file(path, encoding='gbk')
+        gdf.to_file(path, encoding=encoding)
     except Exception as e:
         log_callback(f"    错误: 生成Link SHP失败 - {e}")
 
-def _create_node_shp(nodes_df, path, log_callback=print):
+def _create_node_shp(nodes_df, path, encoding, log_callback=print):
     """从Node DataFrame创建并保存Shapefile。"""
     log_callback(f"    正在生成: {os.path.basename(path)}")
     if 'geometry' not in nodes_df.columns or nodes_df['geometry'].isnull().all():
@@ -457,6 +661,6 @@ def _create_node_shp(nodes_df, path, log_callback=print):
              nodes_df['geometry'] = nodes_df['geometry'].apply(wkt.loads)
              
         gdf = gpd.GeoDataFrame(nodes_df, geometry='geometry')
-        gdf.to_file(path, encoding='gbk')
+        gdf.to_file(path, encoding=encoding)
     except Exception as e:
         log_callback(f"    错误: 生成Node SHP失败 - {e}")

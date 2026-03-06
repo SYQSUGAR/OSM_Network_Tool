@@ -5,6 +5,7 @@ from shapely.geometry import Point, LineString
 import os
 import networkx as nx
 import re
+import utm # Need to install: pip install utm
 
 # ==============================================================================
 # 核心处理类 (Core Processing Logic)
@@ -39,6 +40,16 @@ class DataProcessor:
             link_map_df.columns = link_map_df.columns.str.strip()
             node_map_df.columns = node_map_df.columns.str.strip()
             attr_map_df.columns = attr_map_df.columns.str.strip()
+
+            # 数据清洗: 去除字符串列的前后空格，并将空字符串转换为 NaN
+            # 解决用户反馈的 "明明是空的单元格，.notnull()判断出来确实true" 的问题
+            for df in [link_map_df, node_map_df, attr_map_df]:
+                # 仅处理 object 类型的列 (通常是字符串)
+                str_cols = df.select_dtypes(include=['object']).columns
+                for col in str_cols:
+                    # 转为字符串 -> 去空格 -> 将空字符串或 'nan' 替换为 None
+                    df[col] = df[col].astype(str).str.strip()
+                    df[col] = df[col].replace({'': None, 'nan': None, 'None': None})
 
             # ------------------------------------------------------------------
             # Link 表头映射处理
@@ -233,7 +244,7 @@ class DataProcessor:
     def export_preview_data(self, output_dir, encoding='gbk', target_crs=None, log_callback=print):
         """
         导出当前筛选后的预览数据
-        target_crs: 目标坐标系 (如 'EPSG:32650' 或 '32650'), None则保持原样
+        target_crs: 目标坐标系 (如 'EPSG:32650', '32650', 或 'Auto')
         """
         if self.preview_links_gdf is None or self.preview_nodes_gdf is None:
             raise ValueError("没有可导出的预览数据，请先生成预览。")
@@ -248,15 +259,47 @@ class DataProcessor:
         
         if target_crs:
             try:
-                # 处理纯数字输入 (如 "32650" -> "EPSG:32650")
-                if str(target_crs).isdigit():
-                    target_crs = f"EPSG:{target_crs}"
+                final_crs = None
                 
-                log_callback(f"正在进行坐标投影转换: {target_crs}...")
-                export_links_gdf = export_links_gdf.to_crs(target_crs)
-                export_nodes_gdf = export_nodes_gdf.to_crs(target_crs)
+                # 1. 自动计算 UTM (Auto)
+                if str(target_crs).lower() == 'auto':
+                    log_callback("正在自动计算 UTM 投影...")
+                    # 获取中心点坐标 (WGS84)
+                    # 确保当前是 4326
+                    if export_links_gdf.crs != "EPSG:4326":
+                         temp_gdf = export_links_gdf.to_crs("EPSG:4326")
+                    else:
+                         temp_gdf = export_links_gdf
+                         
+                    centroid = temp_gdf.unary_union.centroid
+                    # 使用 utm 库计算 Zone
+                    lat, lon = centroid.y, centroid.x
+                    _, _, zone_number, zone_letter = utm.from_latlon(lat, lon)
+                    
+                    # 构造 EPSG 代码
+                    # 北半球: 326xx, 南半球: 327xx
+                    is_northern = zone_letter >= 'N'
+                    base_epsg = 32600 if is_northern else 32700
+                    epsg_code = base_epsg + zone_number
+                    final_crs = f"EPSG:{epsg_code}"
+                    log_callback(f"  计算结果: UTM Zone {zone_number}{zone_letter} -> {final_crs}")
+                
+                # 2. 指定 EPSG
+                else:
+                    if str(target_crs).isdigit():
+                        final_crs = f"EPSG:{target_crs}"
+                    else:
+                        final_crs = target_crs
+
+                if final_crs:
+                    log_callback(f"正在进行坐标投影转换: {final_crs}...")
+                    export_links_gdf = export_links_gdf.to_crs(final_crs)
+                    export_nodes_gdf = export_nodes_gdf.to_crs(final_crs)
+                    
             except Exception as e:
                 log_callback(f"警告: 坐标转换失败 ({e})，将使用原始坐标系导出。")
+                import traceback
+                log_callback(traceback.format_exc())
         
         # 导出文件名 (筛选版)
         link_excel_path = os.path.join(output_dir, "link_processed.xlsx")
@@ -457,7 +500,13 @@ class DataProcessor:
                 # 只有匹配成功的部分才更新等级为数字，否则保留原等级？
                 # Notebook 逻辑是直接赋值。
                 self.links_df[road_level_col] = matched_attrs['道路等级Num'].values
-
+            
+            # 仅保留中文表头不为空的那些属性 (Notebook: RoadTSCsv = RoadTSCsv[roadTitleEO[~roadTitleEO['中文表头'].isnull()]['中文表头']])
+            link_map = self.mapping_files.get('link_osm_index')
+            if link_map is not None:
+                valid_cols = link_map[link_map['中文表头'].notnull()]['中文表头'].unique().tolist()
+                self.links_df = self.links_df[[c for c in valid_cols if c in self.links_df.columns]]
+                print(link_map['中文表头'].notnull())
         except Exception as e:
             log_callback(f"警告: 更新属性时出错: {e}")
             import traceback

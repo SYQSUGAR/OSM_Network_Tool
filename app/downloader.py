@@ -39,8 +39,20 @@ def process_from_osm_file(osm_file_path, output_directory, log_callback=print):
         raise FileNotFoundError("osm2gmns 未能成功生成 link.csv 或 node.csv 文件。")
 
     log_callback("osm2gmns 处理完成，正在读取生成的 CSV 文件...")
-    links_df = pd.read_csv(link_csv_path)
-    nodes_df = pd.read_csv(node_csv_path)
+    
+    # 辅助读取函数，支持自动编码尝试
+    def _read_generated_csv(path):
+        try:
+            return pd.read_csv(path, encoding='gbk')
+        except UnicodeDecodeError:
+            log_callback(f"GBK 读取失败，切换 UTF-8: {path}")
+            return pd.read_csv(path, encoding='utf-8')
+        except Exception:
+             # 其他异常也尝试 utf-8
+            return pd.read_csv(path, encoding='utf-8')
+
+    links_df = _read_generated_csv(link_csv_path)
+    nodes_df = _read_generated_csv(node_csv_path)
     
     log_callback("osm2gmns 生成的 CSV 文件读取成功。")
     # osm2gmns 处理后返回 (nodes, links)
@@ -56,7 +68,16 @@ def read_from_csv_files(link_path, node_path, log_callback=print):
         if ext in ['.xlsx', '.xls']:
             return pd.read_excel(path)
         else:
-            return pd.read_csv(path)
+            # 尝试使用 gbk 读取，失败则尝试 utf-8
+            try:
+                return pd.read_csv(path, encoding='gbk')
+            except UnicodeDecodeError:
+                log_callback(f"GBK 读取失败，尝试使用 UTF-8 读取: {path}")
+                return pd.read_csv(path, encoding='utf-8')
+            except Exception as e:
+                # 如果是其他错误，也尝试 utf-8 兜底，或者抛出异常
+                log_callback(f"读取 CSV 出错 ({e})，尝试使用 UTF-8 读取: {path}")
+                return pd.read_csv(path, encoding='utf-8')
 
     log_callback(f"正在读取 Link 文件: {link_path}")
     log_callback(f"正在读取 Node 文件: {node_path}")

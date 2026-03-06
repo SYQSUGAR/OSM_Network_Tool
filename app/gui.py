@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QGroupBox, QFrame, QRadioButton, QButtonGroup, QTabWidget, QStackedWidget, QCheckBox,
                              QTableView, QHeaderView, QSplitter, QComboBox, QColorDialog, QTableWidget, QTableWidgetItem)
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel
 from shapely import wkt
 import geopandas as gpd
 
@@ -21,6 +21,42 @@ except ImportError:
 
 from .downloader import download_from_osmnx, process_from_osm_file, read_from_csv_files
 from .processor import DataProcessor, export_results
+
+class PandasModel(QAbstractTableModel):
+    """
+    A efficient model to display pandas DataFrame in QTableView.
+    Avoids freezing UI with large datasets.
+    """
+    def __init__(self, df=pd.DataFrame()):
+        super().__init__()
+        self._df = df
+
+    def rowCount(self, parent=None):
+        return self._df.shape[0]
+
+    def columnCount(self, parent=None):
+        return self._df.shape[1]
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if index.isValid():
+            if role == Qt.ItemDataRole.DisplayRole:
+                val = self._df.iat[index.row(), index.column()]
+                if pd.isnull(val):
+                    return ""
+                return str(val)
+            elif role == Qt.ItemDataRole.TextAlignmentRole:
+                return Qt.AlignmentFlag.AlignCenter
+        return None
+
+    def headerData(self, col, orientation, role):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return str(self._df.columns[col])
+        return None
+
+    def set_data(self, df):
+        self.beginResetModel()
+        self._df = df
+        self.endResetModel()
 
 class WorkerThread(QThread):
     log_signal = pyqtSignal(str)
@@ -272,6 +308,10 @@ class MainWindow(QMainWindow):
             QPushButton#SuccessBtn:hover { background-color: #27ae60; }
             QPushButton#SuccessBtn:disabled { background-color: #95a5a6; }
 
+            QPushButton#StopBtn { background-color: #e74c3c; color: white; border: none; font-weight: bold; }
+            QPushButton#StopBtn:hover { background-color: #c0392b; }
+            QPushButton#StopBtn:disabled { background-color: #95a5a6; }
+
             QGroupBox { font-weight: bold; border: 1px solid #dcdde1; border-radius: 6px; margin-top: 6px; padding-top: 5px; }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
             
@@ -408,7 +448,7 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self.start_preprocess)
         
         self.btn_stop_preprocess = QPushButton("停止")
-        self.btn_stop_preprocess.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        self.btn_stop_preprocess.setObjectName("StopBtn")
         self.btn_stop_preprocess.setEnabled(False) # Default disabled
         self.btn_stop_preprocess.clicked.connect(self.stop_current_worker)
 
@@ -459,12 +499,23 @@ class MainWindow(QMainWindow):
         # Export Controls Row (CRS + Export + Stop)
         export_ctrl_layout = QHBoxLayout()
         
-        export_ctrl_layout.addWidget(QLabel("导出坐标系(EPSG):"))
+        export_ctrl_layout.addWidget(QLabel("导出坐标系:"))
+        
+        # 坐标系下拉选择框
+        self.crs_combo = QComboBox()
+        self.crs_combo.setEditable(False) # 用户不能直接编辑下拉框文本，但可以通过输入框修改
+        self.crs_combo.addItems(["WGS84 (4326)", "Web Mercator (3857)", "Auto (UTM)", "Custom"])
+        self.crs_combo.currentIndexChanged.connect(self.on_crs_combo_changed)
+        self.crs_combo.setFixedWidth(120)
+        export_ctrl_layout.addWidget(self.crs_combo)
+
+        # 坐标系输入框 (用于显示EPSG代码或手动输入)
         self.crs_input = QLineEdit()
-        self.crs_input.setPlaceholderText("默认(4326)")
+        self.crs_input.setPlaceholderText("EPSG Code")
+        self.crs_input.setText("4326") # 默认 WGS84
         self.crs_input.setFixedWidth(80)
         export_ctrl_layout.addWidget(self.crs_input)
-        
+
         # Export Button (Always visible/enabled if conversion off?)
         self.export_filtered_btn = QPushButton("导出数据")
         self.export_filtered_btn.setObjectName("SuccessBtn")
@@ -472,7 +523,7 @@ class MainWindow(QMainWindow):
         export_ctrl_layout.addWidget(self.export_filtered_btn)
         
         self.btn_stop_export = QPushButton("停止")
-        self.btn_stop_export.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        self.btn_stop_export.setObjectName("StopBtn")
         self.btn_stop_export.setEnabled(False)
         self.btn_stop_export.clicked.connect(self.stop_current_worker)
         export_ctrl_layout.addWidget(self.btn_stop_export)
@@ -580,7 +631,9 @@ class MainWindow(QMainWindow):
         self.attr_progress_bar = QProgressBar()
         self.attr_progress_bar.setRange(0, 0)
         self.attr_progress_bar.hide()
-        self.attr_progress_bar.setFixedWidth(100)
+        # 将固定宽度改为自适应或增加宽度
+        self.attr_progress_bar.setMinimumWidth(200) # Minimum width
+        # self.attr_progress_bar.setFixedWidth(100) # Removed fixed width
         
         self.btn_maximize_attr = QPushButton("最大化")
         self.btn_maximize_attr.setCheckable(True)
@@ -594,10 +647,18 @@ class MainWindow(QMainWindow):
         
         # Tabbed Table for Links/Nodes
         self.attr_tabs = QTabWidget()
-        self.link_attr_table = QTableWidget()
-        self.node_attr_table = QTableWidget()
-        self.attr_tabs.addTab(self.link_attr_table, "Link属性")
-        self.attr_tabs.addTab(self.node_attr_table, "Node属性")
+        
+        # 使用 QTableView + PandasModel 替代 QTableWidget，提升大数据性能
+        self.link_attr_view = QTableView()
+        self.link_attr_model = PandasModel()
+        self.link_attr_view.setModel(self.link_attr_model)
+        
+        self.node_attr_view = QTableView()
+        self.node_attr_model = PandasModel()
+        self.node_attr_view.setModel(self.node_attr_model)
+        
+        self.attr_tabs.addTab(self.link_attr_view, "Link属性")
+        self.attr_tabs.addTab(self.node_attr_view, "Node属性")
         attr_layout.addWidget(self.attr_tabs)
         
         self.attr_widget.show() # Container manages visibility now
@@ -1042,8 +1103,8 @@ class MainWindow(QMainWindow):
 
             self.start_worker_task('filter_and_export')
         else:
-            # 原始导出
-            self.start_worker_task('export_raw')
+            # 原始导出 - 对应导出停止按钮
+            self.start_worker_task('export_raw_with_stop') # 修改任务类型以匹配导出停止逻辑
 
     def start_preview_generation(self):
         if self.format_conversion_checkbox.isChecked():
@@ -1054,6 +1115,11 @@ class MainWindow(QMainWindow):
             self.start_worker_task('preview_raw')
 
     def start_worker_task(self, task_type):
+        # 规范化任务类型映射
+        actual_task_type = task_type
+        if task_type == 'export_raw_with_stop':
+            actual_task_type = 'export_raw'
+        
         # 防御性编程: 如果已有正在运行的任务，先强制停止
         if hasattr(self, 'worker') and self.worker is not None:
              # 如果 worker 还在，即使 not isRunning()，也应该清理
@@ -1075,20 +1141,20 @@ class MainWindow(QMainWindow):
         if mode == 'online':
             input_val = self.city_input.text().strip()
             # 验证输入: 对于需要获取数据的任务，输入不能为空
-            if not input_val and task_type in ['preprocess', 'export_raw', 'preview_raw']:
+            if not input_val and actual_task_type in ['preprocess', 'export_raw', 'preview_raw']:
                 QMessageBox.warning(self, "输入错误", "请输入城市名称。")
                 return
 
         elif mode == 'osm':
             input_val = self.osm_file_input.text().strip()
-            if not input_val and task_type in ['preprocess', 'export_raw', 'preview_raw']:
+            if not input_val and actual_task_type in ['preprocess', 'export_raw', 'preview_raw']:
                 QMessageBox.warning(self, "输入错误", "请选择OSM文件。")
                 return
 
         elif mode == 'csv':
             link_f = self.link_file_input.text().strip()
             node_f = self.node_file_input.text().strip()
-            if (not link_f or not node_f) and task_type in ['preprocess', 'export_raw', 'preview_raw']:
+            if (not link_f or not node_f) and actual_task_type in ['preprocess', 'export_raw', 'preview_raw']:
                 QMessageBox.warning(self, "输入错误", "请选择CSV文件。")
                 return
             input_val = {"link": link_f, "node": node_f}
@@ -1098,7 +1164,7 @@ class MainWindow(QMainWindow):
         
         # 收集筛选条件
         selected_block_ids = []
-        if task_type in ['filter_and_export', 'preview_processed']:
+        if actual_task_type in ['filter_and_export', 'preview_processed']:
             # Get selected blocks
             for i in range(self.block_table_model.rowCount()):
                 index = self.block_table_model.index(i, 0)
@@ -1109,17 +1175,27 @@ class MainWindow(QMainWindow):
                         selected_block_ids.append(int(self.block_table_model.item(i, 1).text()))
             
             # Validation for processed tasks
-            if not self.processor.processed_links_gdf is None and not selected_block_ids and task_type == 'filter_and_export':
+            if not self.processor.processed_links_gdf is None and not selected_block_ids and actual_task_type == 'filter_and_export':
                  # Validation already done in start_filter_export, but kept as safety
                  QMessageBox.warning(self, "提示", "请选择至少一个区块。")
                  return
 
         # 获取自定义坐标系
-        target_crs = None
+        target_crs = "EPSG:4326" # Default WGS84
         if hasattr(self, 'crs_input'):
              epsg_code = self.crs_input.text().strip()
              if epsg_code:
-                 target_crs = epsg_code # Pass string "EPSG:xxxx" or just "xxxx"
+                 # Check for "Auto" (case insensitive)
+                 if epsg_code.lower() == 'auto':
+                     target_crs = 'Auto'
+                 # Check if user entered just a number or full EPSG string
+                 elif epsg_code.isdigit():
+                     target_crs = f"EPSG:{epsg_code}"
+                 else:
+                     target_crs = epsg_code 
+             else:
+                 # If empty, fallback to 4326 as requested
+                 target_crs = "EPSG:4326"
 
         # Prepare kwargs
         task_kwargs = {
@@ -1132,12 +1208,12 @@ class MainWindow(QMainWindow):
             'target_crs': target_crs
         }
         
-        # UI State Update
+        # UI State Update - 使用原始 task_type 来控制按钮逻辑
         self.set_ui_busy(True, task_type)
         self.log_area.clear()
         self.current_log_widget = self.log_area # Shared log area
         
-        self.worker = WorkerThread(task_type, **task_kwargs)
+        self.worker = WorkerThread(actual_task_type, **task_kwargs)
         self.worker.log_signal.connect(self.log)
         self.worker.finished_signal.connect(self.on_task_finished)
         self.worker.start()
@@ -1176,64 +1252,50 @@ class MainWindow(QMainWindow):
         busy: True/False
         task_type: 'preprocess' (Acquisition) 或 'filter_and_export' (Export) 等
         """
-        # CSS Styles
-        disabled_style = "color: gray; background-color: #f0f0f0;"
-        normal_style = ""
-        stop_style = "background-color: #e74c3c; color: white; font-weight: bold;"
+        # 修改任务类型判断逻辑
+        # 'export_raw_with_stop' 是为了区分原始导出操作，它应该被视为导出任务
+        is_preprocess_task = task_type in ['preprocess', 'preview_raw']
+        # 注意: 'export_raw' 之前被归类为 preprocess，现在如果它被明确为导出任务，应该移到下面
+        # 但 'export_raw' 在没有格式转换时是直接导出，逻辑上它是一个“导出”操作
         
-        is_preprocess_task = task_type in ['preprocess', 'export_raw', 'preview_raw']
-        is_export_task = task_type in ['filter_and_export']
+        is_export_task = task_type in ['filter_and_export', 'export_preview_current', 'export_raw_with_stop', 'export_raw']
 
         if busy:
-            # Global Disable (except relevant Stop button)
+            # 1. 在任务运行期间，禁用所有“开始”类按钮
             self.run_btn.setEnabled(False)
             self.export_filtered_btn.setEnabled(False)
             self.preview_btn.setEnabled(False)
             
-            # Apply disabled style
-            self.run_btn.setStyleSheet(disabled_style)
-            self.export_filtered_btn.setStyleSheet(disabled_style)
-
-            # Enable specific STOP button
+            # 2. 根据任务类型，仅启用对应的“停止”按钮
             if is_preprocess_task:
-                if hasattr(self, 'btn_stop_preprocess'): 
-                    self.btn_stop_preprocess.setEnabled(True)
-                    self.btn_stop_preprocess.setStyleSheet(stop_style)
-                if hasattr(self, 'btn_stop_export'): 
-                    self.btn_stop_export.setEnabled(False)
-                    self.btn_stop_export.setStyleSheet(disabled_style)
-            
+                # 正在进行数据处理/获取
+                self.btn_stop_preprocess.setEnabled(True)
+                self.btn_stop_export.setEnabled(False)
             elif is_export_task:
-                if hasattr(self, 'btn_stop_preprocess'): 
-                    self.btn_stop_preprocess.setEnabled(False)
-                    self.btn_stop_preprocess.setStyleSheet(disabled_style)
-                if hasattr(self, 'btn_stop_export'): 
-                    self.btn_stop_export.setEnabled(True)
-                    self.btn_stop_export.setStyleSheet(stop_style)
+                # 正在进行导出操作
+                self.btn_stop_preprocess.setEnabled(False)
+                self.btn_stop_export.setEnabled(True)
+            else:
+                # 其他可能的异步任务 (如生成预览、预览导出等)
+                # 默认逻辑: 如果没有明确分类，为了安全都禁用停止按钮，或根据需要扩展
+                self.btn_stop_preprocess.setEnabled(False)
+                self.btn_stop_export.setEnabled(False)
             
-            # Show Progress
+            # 显示进度条
             self.progress_bar.show()
-            self.progress_bar.setRange(0, 0) # indeterminate
+            self.progress_bar.setRange(0, 0)
             
         else:
-            # Reset Normal State
+            # 3. 任务结束（正常或停止）后，恢复所有“开始”按钮
             self.run_btn.setEnabled(self.format_conversion_checkbox.isChecked())
             self.export_filtered_btn.setEnabled(True)
             self.preview_btn.setEnabled(True)
             
-            # Reset Styles
-            self.run_btn.setStyleSheet(normal_style)
-            self.export_filtered_btn.setStyleSheet(normal_style)
-            
-            # Disable Stop Buttons
-            if hasattr(self, 'btn_stop_preprocess'): 
-                self.btn_stop_preprocess.setEnabled(False)
-                self.btn_stop_preprocess.setStyleSheet(disabled_style)
-            if hasattr(self, 'btn_stop_export'): 
-                self.btn_stop_export.setEnabled(False)
-                self.btn_stop_export.setStyleSheet(disabled_style)
+            # 4. 任务结束后，禁用所有“停止”按钮
+            self.btn_stop_preprocess.setEnabled(False)
+            self.btn_stop_export.setEnabled(False)
                 
-            # Hide Progress
+            # 隐藏进度条
             self.progress_bar.hide()
 
     def on_task_finished(self, success, result):
@@ -1363,8 +1425,8 @@ class MainWindow(QMainWindow):
                  self.viz_splitter.setSizes([int(current_height*0.6), int(current_height*0.4)])
             
             # Auto-load data if empty
-            if self.link_attr_table.rowCount() == 0:
-                self.update_attribute_tables()
+            if self.link_attr_model.rowCount() == 0:
+                self.start_update_attribute_tables_thread()
         else:
             # Save current sizes before hiding (only if attribute table is visible/non-zero)
             sizes = self.viz_splitter.sizes()
@@ -1415,38 +1477,43 @@ class MainWindow(QMainWindow):
         if success:
             # Result contains (link_data, node_data)
             link_data, node_data = result
-            self._populate_table_widget(self.link_attr_table, link_data)
-            self._populate_table_widget(self.node_attr_table, node_data)
+            # 使用自定义模型更新，瞬间完成渲染，不卡顿
+            if link_data is not None:
+                self.link_attr_model.set_data(link_data)
+                # 触发视图更新
+                self.link_attr_model.layoutChanged.emit()
+                
+            if node_data is not None:
+                self.node_attr_model.set_data(node_data)
+                self.node_attr_model.layoutChanged.emit()
         else:
             QMessageBox.warning(self, "错误", f"更新属性表失败: {result}")
 
     def _populate_table_widget(self, table, df):
-        """Helper to populate QTableWidget from DataFrame."""
-        if df is None or df.empty:
-            table.setRowCount(0)
-            table.setColumnCount(0)
-            return
-            
-        table.setRowCount(df.shape[0])
-        table.setColumnCount(df.shape[1])
-        table.setHorizontalHeaderLabels(df.columns.astype(str))
-        
-        # Disable sorting temporarily for speed
-        table.setSortingEnabled(False)
-        
-        for i in range(df.shape[0]):
-            for j in range(df.shape[1]):
-                val = df.iat[i, j]
-                text = str(val) if pd.notnull(val) else ""
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                table.setItem(i, j, item)
-                
-        table.setSortingEnabled(True)
+        # Deprecated: QTableWidget is too slow for large data. 
+        # Replaced by PandasModel and QTableView.
+        pass
 
     def update_attribute_tables(self):
         # Deprecated: Logic moved to worker thread
         pass
+
+    def on_crs_combo_changed(self, index):
+        """Handle CRS selection change."""
+        text = self.crs_combo.currentText()
+        if "WGS84" in text:
+            self.crs_input.setText("4326")
+            self.crs_input.setEnabled(True)
+        elif "Web Mercator" in text:
+            self.crs_input.setText("3857")
+            self.crs_input.setEnabled(True)
+        elif "Auto" in text:
+            self.crs_input.setText("Auto")
+            self.crs_input.setEnabled(False) # Auto mode doesn't need input
+        elif "Custom" in text:
+            self.crs_input.clear()
+            self.crs_input.setEnabled(True)
+            self.crs_input.setPlaceholderText("e.g. 32650")
 
     def maximize_attr_table(self):
         """Toggle maximize/restore for attribute table."""

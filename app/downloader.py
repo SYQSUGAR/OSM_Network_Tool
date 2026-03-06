@@ -46,17 +46,24 @@ def process_from_osm_file(osm_file_path, output_directory, log_callback=print):
     # osm2gmns 处理后返回 (nodes, links)
     return nodes_df, links_df
 
-def read_from_csv_files(link_csv_path, node_csv_path, log_callback=print):
+def read_from_csv_files(link_path, node_path, log_callback=print):
     """
-    模式3: CSV数据处理
-    直接从用户提供的两个CSV文件中读取 link 和 node 数据。
+    模式3: 数据处理 (支持 CSV 和 Excel)
+    直接从用户提供的两个文件中读取 link 和 node 数据。
     """
-    log_callback(f"正在读取 Link CSV 文件: {link_csv_path}")
-    log_callback(f"正在读取 Node CSV 文件: {node_csv_path}")
+    def _read_file(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ['.xlsx', '.xls']:
+            return pd.read_excel(path)
+        else:
+            return pd.read_csv(path)
+
+    log_callback(f"正在读取 Link 文件: {link_path}")
+    log_callback(f"正在读取 Node 文件: {node_path}")
     
-    links_df = pd.read_csv(link_csv_path)
-    nodes_df = pd.read_csv(node_csv_path)
+    links_df = _read_file(link_path)
+    nodes_df = _read_file(node_path)
     
-    log_callback("CSV 文件读取成功。")
-    # CSV 读取后返回 (nodes, links)
+    log_callback("文件读取成功。")
+    # 读取后返回 (nodes, links)
     return nodes_df, links_df

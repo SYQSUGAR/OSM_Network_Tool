@@ -75,17 +75,44 @@ class DataProcessor:
             # ------------------------------------------------------------------
             # 属性映射处理 (Road Level + Channel -> Attributes)
             # ------------------------------------------------------------------
-            # 假设前两列是索引 (道路等级, is_link/渠道)
-            # 按照 Notebook 逻辑: pd.read_excel(..., index_col=[0, 1])
-            # 这里我们手动设置 index
-            attr_cols = list(attr_map_df.columns)
-            if len(attr_cols) >= 2:
-                # 确保索引列没有空格
-                attr_map_df[attr_cols[0]] = attr_map_df[attr_cols[0]].astype(str).str.strip()
-                # 第二列通常是 0/1 (is_link)，保持原样或转int
-                attr_map = attr_map_df.set_index([attr_cols[0], attr_cols[1]])
+            # 严格使用 ['OSM道路等级', '渠道'] 作为索引
+            required_indices = ['OSM道路等级', '渠道']
+            missing_indices = [col for col in required_indices if col not in attr_map_df.columns]
+            
+            if not missing_indices:
+                # 严格按照用户要求设置数据类型
+                # 字符串类型: OSM道路等级, 道路等级
+                # 整型: 渠道, 道路等级Num, 机动车道数, 机非分隔
+                # 浮点型: 机动车道宽度, 非机动车道宽度
+                
+                # 1. 字符串
+                str_cols = ['OSM道路等级', '道路等级']
+                for col in str_cols:
+                    if col in attr_map_df.columns:
+                        attr_map_df[col] = attr_map_df[col].astype(str).str.strip()
+                
+                # 2. 整型 (先转numeric处理非数字，再fillna 0，再转int)
+                int_cols = ['渠道', '道路等级Num', '机动车道数', '机非分隔']
+                for col in int_cols:
+                    if col in attr_map_df.columns:
+                        attr_map_df[col] = pd.to_numeric(attr_map_df[col], errors='coerce').fillna(0).astype(int)
+                        
+                # 3. 浮点型
+                float_cols = ['机动车道宽度', '非机动车道宽度']
+                for col in float_cols:
+                    if col in attr_map_df.columns:
+                        attr_map_df[col] = pd.to_numeric(attr_map_df[col], errors='coerce')
+
+                # 设置索引
+                attr_map = attr_map_df.set_index(required_indices)
             else:
-                attr_map = attr_map_df # Fallback
+                print(f"Error: Attribute mapping missing required columns: {missing_indices}. Please check your mapping file.")
+                # 这里不应该 Fallback，直接返回空或报错更好，但为了不完全崩溃，暂时设为空映射或原样
+                # 既然用户说以后都规定为OSM道路等级，这里我们就不做任何猜测了
+                # 如果没有这两个列，属性映射将无法正常工作，后续 lookup 会失败
+                attr_map = attr_map_df 
+                # 可以在这里抛出异常，或者让 UI 层捕获
+                # raise ValueError(f"Attribute mapping file must contain columns: {required_indices}")
 
             self.mapping_files = {
                 'link_osm_index': link_osm_index,
@@ -203,8 +230,11 @@ class DataProcessor:
             log_callback(traceback.format_exc())
             return False
 
-    def export_preview_data(self, output_dir, encoding='gbk', log_callback=print):
-        """导出当前筛选后的预览数据"""
+    def export_preview_data(self, output_dir, encoding='gbk', target_crs=None, log_callback=print):
+        """
+        导出当前筛选后的预览数据
+        target_crs: 目标坐标系 (如 'EPSG:32650' 或 '32650'), None则保持原样
+        """
         if self.preview_links_gdf is None or self.preview_nodes_gdf is None:
             raise ValueError("没有可导出的预览数据，请先生成预览。")
             
@@ -212,6 +242,22 @@ class DataProcessor:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
             
+        # 准备导出的 GDF (可能需要投影)
+        export_links_gdf = self.preview_links_gdf.copy()
+        export_nodes_gdf = self.preview_nodes_gdf.copy()
+        
+        if target_crs:
+            try:
+                # 处理纯数字输入 (如 "32650" -> "EPSG:32650")
+                if str(target_crs).isdigit():
+                    target_crs = f"EPSG:{target_crs}"
+                
+                log_callback(f"正在进行坐标投影转换: {target_crs}...")
+                export_links_gdf = export_links_gdf.to_crs(target_crs)
+                export_nodes_gdf = export_nodes_gdf.to_crs(target_crs)
+            except Exception as e:
+                log_callback(f"警告: 坐标转换失败 ({e})，将使用原始坐标系导出。")
+        
         # 导出文件名 (筛选版)
         link_excel_path = os.path.join(output_dir, "link_processed.xlsx")
         node_excel_path = os.path.join(output_dir, "node_processed.xlsx")
@@ -220,19 +266,19 @@ class DataProcessor:
         
         # 导出 Link
         log_callback(f"正在写入: {os.path.basename(link_excel_path)}")
-        links_df_export = pd.DataFrame(self.preview_links_gdf.drop(columns='geometry'))
-        links_df_export['geometry'] = self.preview_links_gdf['geometry'].apply(lambda x: x.wkt)
+        links_df_export = pd.DataFrame(export_links_gdf.drop(columns='geometry'))
+        links_df_export['geometry'] = export_links_gdf['geometry'].apply(lambda x: x.wkt)
         links_df_export.to_excel(link_excel_path, index=False)
         
         log_callback(f"正在生成: {os.path.basename(link_shp_path)}")
-        self.preview_links_gdf.to_file(link_shp_path, encoding=encoding)
+        export_links_gdf.to_file(link_shp_path, encoding=encoding)
         
         # 导出 Node
         log_callback(f"正在写入: {os.path.basename(node_excel_path)}")
-        nodes_df_export = pd.DataFrame(self.preview_nodes_gdf.drop(columns='geometry'))
-        nodes_df_export['geometry'] = self.preview_nodes_gdf['geometry'].apply(lambda x: x.wkt)
+        nodes_df_export = pd.DataFrame(export_nodes_gdf.drop(columns='geometry'))
+        nodes_df_export['geometry'] = export_nodes_gdf['geometry'].apply(lambda x: x.wkt)
         nodes_df_export.to_excel(node_excel_path, index=False)
-        self.preview_nodes_gdf.to_file(node_shp_path, encoding=encoding)
+        export_nodes_gdf.to_file(node_shp_path, encoding=encoding)
         
         log_callback(f"文件已保存至: {output_dir}")
         return output_dir
@@ -391,12 +437,9 @@ class DataProcessor:
             
             # 为了严谨且简单，我们先获取 attr_map 中存在的索引
             valid_attr_map = attr_map[~attr_map.index.duplicated(keep='first')]
-            print(attr_map)
-            print(valid_attr_map.index)
             # 直接使用 loc 获取 (可能会有缺失，缺失的会返回 NaN)
             # 使用 reindex 是最安全且最接近 Notebook 逻辑的方式
             matched_attrs = valid_attr_map.loc[road_index,:]
-            print(matched_attrs)
             # 更新各列
             if width_col and '机动车道宽度' in attr_cols:
                 self.links_df[width_col] = matched_attrs['机动车道宽度'].values

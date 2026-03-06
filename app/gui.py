@@ -107,9 +107,28 @@ class WorkerThread(QThread):
                 processor.generate_preview_data(self.kwargs.get('filter_criteria'), log_callback=self.log_signal.emit)
                 result = processor.export_preview_data(self.kwargs.get('output_dir'), 
                                                       encoding=self.kwargs.get('encoding', 'gbk'),
+                                                      target_crs=self.kwargs.get('target_crs'),
                                                       log_callback=self.log_signal.emit)
                 self.log_signal.emit(f"--- 筛选和导出成功！---")
                 self.finished_signal.emit(True, result)
+
+            elif self.task_type == 'update_attr_table':
+                # 异步更新属性表任务
+                # 此任务不需要 log_signal (或根据需要)
+                filter_criteria = self.kwargs.get('filter_criteria')
+                if processor.processed_links_gdf is None:
+                    raise ValueError("未找到处理后的数据。")
+                
+                # 筛选数据
+                links = processor.processed_links_gdf[processor.processed_links_gdf['区块ID'].isin(filter_criteria)]
+                nodes = processor.processed_nodes_gdf[processor.processed_nodes_gdf['区块ID'].isin(filter_criteria)]
+                
+                # 准备显示数据 (drop geometry)
+                links_display = links.drop(columns='geometry') if 'geometry' in links.columns else links
+                nodes_display = nodes.drop(columns='geometry') if 'geometry' in nodes.columns else nodes
+                
+                # 返回 DataFrame
+                self.finished_signal.emit(True, (links_display, nodes_display))
 
             elif self.task_type == 'preview_processed':
                 self.log_signal.emit("正在生成筛选后的预览数据...")
@@ -182,14 +201,15 @@ class MainWindow(QMainWindow):
         self.DEFAULT_ATTR_MAP = os.path.join(self.resources_dir, "路网字段属性映射关系.xlsx")
         
         # User modified paths (stored in config folder)
-        self.USER_NODE_MAP = os.path.join(self.config_dir, "user_node_header_mapping.xlsx")
-        self.USER_LINK_MAP = os.path.join(self.config_dir, "user_link_header_mapping.xlsx")
-        self.USER_ATTR_MAP = os.path.join(self.config_dir, "user_attr_mapping.xlsx")
+        self.USER_NODE_MAP = os.path.join(self.config_dir, "节点表头映射关系.xlsx")
+        self.USER_LINK_MAP = os.path.join(self.config_dir, "路网表头映射关系.xlsx")
+        self.USER_ATTR_MAP = os.path.join(self.config_dir, "路网字段属性映射关系.xlsx")
 
         # Table Widgets References
         self.node_table = None
         self.link_table = None
         self.attr_table = None
+        self.worker = None  # Initialize worker reference
 
         # 用于动态指向当前应输出日志的 QTextEdit
         self.current_log_widget = None
@@ -330,19 +350,29 @@ class MainWindow(QMainWindow):
         p3 = QWidget()
         l3 = QVBoxLayout(p3)
         l3.setContentsMargins(0,0,0,0)
+        
+        # Link Row
         row_link = QHBoxLayout()
+        lbl_link = QLabel("Link:")
+        lbl_link.setFixedWidth(40) # 固定宽度以确保对齐
+        row_link.addWidget(lbl_link)
         self.link_file_input = QLineEdit()
-        btn_link = QPushButton("Link")
-        btn_link.clicked.connect(lambda: self.browse_file(self.link_file_input, "CSV (*.csv)", 'osm'))
+        btn_link = QPushButton("浏览")
+        btn_link.clicked.connect(lambda: self.browse_file(self.link_file_input, "Data Files (*.csv *.xlsx *.xls)", 'osm'))
         row_link.addWidget(self.link_file_input)
         row_link.addWidget(btn_link)
         
+        # Node Row
         row_node = QHBoxLayout()
+        lbl_node = QLabel("Node:")
+        lbl_node.setFixedWidth(40) # 固定宽度以确保对齐
+        row_node.addWidget(lbl_node)
         self.node_file_input = QLineEdit()
-        btn_node = QPushButton("Node")
-        btn_node.clicked.connect(lambda: self.browse_file(self.node_file_input, "CSV (*.csv)", 'osm'))
+        btn_node = QPushButton("浏览")
+        btn_node.clicked.connect(lambda: self.browse_file(self.node_file_input, "Data Files (*.csv *.xlsx *.xls)", 'osm'))
         row_node.addWidget(self.node_file_input)
         row_node.addWidget(btn_node)
+        
         l3.addLayout(row_link)
         l3.addLayout(row_node)
         self.input_stack.addWidget(p3)
@@ -372,10 +402,19 @@ class MainWindow(QMainWindow):
         acq_layout.addWidget(self.format_conversion_checkbox)
 
         # Preprocess Button
+        btn_process_layout = QHBoxLayout()
         self.run_btn = QPushButton("开始预处理")
         self.run_btn.setObjectName("PrimaryBtn")
         self.run_btn.clicked.connect(self.start_preprocess)
-        acq_layout.addWidget(self.run_btn)
+        
+        self.btn_stop_preprocess = QPushButton("停止")
+        self.btn_stop_preprocess.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        self.btn_stop_preprocess.setEnabled(False) # Default disabled
+        self.btn_stop_preprocess.clicked.connect(self.stop_current_worker)
+
+        btn_process_layout.addWidget(self.run_btn)
+        btn_process_layout.addWidget(self.btn_stop_preprocess)
+        acq_layout.addLayout(btn_process_layout)
         
         left_layout.addWidget(acq_group)
 
@@ -417,11 +456,28 @@ class MainWindow(QMainWindow):
         self.block_table_view.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         filter_layout.addWidget(self.block_table_view)
         
+        # Export Controls Row (CRS + Export + Stop)
+        export_ctrl_layout = QHBoxLayout()
+        
+        export_ctrl_layout.addWidget(QLabel("导出坐标系(EPSG):"))
+        self.crs_input = QLineEdit()
+        self.crs_input.setPlaceholderText("默认(4326)")
+        self.crs_input.setFixedWidth(80)
+        export_ctrl_layout.addWidget(self.crs_input)
+        
         # Export Button (Always visible/enabled if conversion off?)
         self.export_filtered_btn = QPushButton("导出数据")
         self.export_filtered_btn.setObjectName("SuccessBtn")
         self.export_filtered_btn.clicked.connect(self.start_filter_export)
-        filter_layout.addWidget(self.export_filtered_btn)
+        export_ctrl_layout.addWidget(self.export_filtered_btn)
+        
+        self.btn_stop_export = QPushButton("停止")
+        self.btn_stop_export.setStyleSheet("background-color: #e74c3c; color: white; font-weight: bold;")
+        self.btn_stop_export.setEnabled(False)
+        self.btn_stop_export.clicked.connect(self.stop_current_worker)
+        export_ctrl_layout.addWidget(self.btn_stop_export)
+        
+        filter_layout.addLayout(export_ctrl_layout)
         
         # Log Area
         self.log_area = QTextEdit()
@@ -430,9 +486,15 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(self.log_area)
         
         # Progress Bar
+        progress_layout = QHBoxLayout()
+        progress_layout.addStretch() # Push to right
         self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedWidth(200) # Optional: fix width
         self.progress_bar.hide()
-        filter_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_bar)
+        # progress_layout.setContentsMargins(0,0,0,0) # Optional
+        
+        filter_layout.addLayout(progress_layout)
         
         left_layout.addWidget(self.filter_group)
         
@@ -513,13 +575,19 @@ class MainWindow(QMainWindow):
         # Removed redundant toggle button
         
         self.btn_update_attr = QPushButton("更新数据")
-        self.btn_update_attr.clicked.connect(self.update_attribute_tables)
+        self.btn_update_attr.clicked.connect(self.start_update_attribute_tables_thread)
+        
+        self.attr_progress_bar = QProgressBar()
+        self.attr_progress_bar.setRange(0, 0)
+        self.attr_progress_bar.hide()
+        self.attr_progress_bar.setFixedWidth(100)
         
         self.btn_maximize_attr = QPushButton("最大化")
         self.btn_maximize_attr.setCheckable(True)
         self.btn_maximize_attr.clicked.connect(self.maximize_attr_table)
         
         attr_header.addWidget(self.btn_update_attr)
+        attr_header.addWidget(self.attr_progress_bar)
         attr_header.addStretch()
         attr_header.addWidget(self.btn_maximize_attr)
         attr_layout.addLayout(attr_header)
@@ -594,7 +662,11 @@ class MainWindow(QMainWindow):
         btn_export_config = QPushButton("导出当前配置")
         btn_export_config.clicked.connect(self.export_current_config)
 
+        btn_export_ref = QPushButton("导出参考文件")
+        btn_export_ref.clicked.connect(self.export_reference_files)
+
         btn_layout.addStretch()
+        btn_layout.addWidget(btn_export_ref)
         btn_layout.addWidget(btn_export_config)
         btn_layout.addWidget(btn_apply)
         
@@ -695,10 +767,24 @@ class MainWindow(QMainWindow):
             table.setColumnCount(df.shape[1])
             table.setHorizontalHeaderLabels(df.columns.astype(str))
             
+            # Center Align Header
+            for i in range(table.columnCount()):
+                header_item = table.horizontalHeaderItem(i)
+                if header_item:
+                    header_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            
             for i in range(df.shape[0]):
                 for j in range(df.shape[1]):
                     val = df.iat[i, j]
-                    item = QTableWidgetItem(str(val) if pd.notnull(val) else "")
+                    # 保持原始格式显示 (如 3 而不是 3.0, 如果是int)
+                    if pd.isnull(val):
+                        text = ""
+                    else:
+                        text = str(val)
+                        if isinstance(val, float) and val.is_integer():
+                             text = str(int(val))
+                    
+                    item = QTableWidgetItem(text)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter) # 居中对齐
                     table.setItem(i, j, item)
         except Exception as e:
@@ -707,10 +793,16 @@ class MainWindow(QMainWindow):
     def apply_settings(self):
         """Save tables to User Config files and update Processor."""
         try:
+            # 0. 规范化表格内容 (仅针对属性表，其他表保持字符串)
+            self._normalize_attr_table_data()
+
             # 1. Save to User Files
-            self.save_table_to_file(self.node_table, self.USER_NODE_MAP)
-            self.save_table_to_file(self.link_table, self.USER_LINK_MAP)
-            self.save_table_to_file(self.attr_table, self.USER_ATTR_MAP)
+            # Node/Link 表头映射: 保持原始字符串，允许空值
+            self.save_table_to_file(self.node_table, self.USER_NODE_MAP, force_string=True)
+            self.save_table_to_file(self.link_table, self.USER_LINK_MAP, force_string=True)
+            
+            # Attribute 映射: 已规范化，按推断类型保存
+            self.save_table_to_file(self.attr_table, self.USER_ATTR_MAP, force_string=False)
             
             # 2. Update Processor
             if self.update_processor_mappings():
@@ -720,12 +812,107 @@ class MainWindow(QMainWindow):
                 
         except Exception as e:
              QMessageBox.critical(self, "错误", f"应用配置失败: {e}")
+             import traceback
+             traceback.print_exc()
 
-    def save_table_to_file(self, table, file_path):
-        df = self.get_table_data(table)
+    def _normalize_attr_table_data(self):
+        """规范化属性映射表的数据类型并更新UI"""
+        table = self.attr_table
+        rows = table.rowCount()
+        cols = table.columnCount()
+        headers = [table.horizontalHeaderItem(j).text() for j in range(cols)]
+        
+        # 定义列类型规范
+        type_mapping = {
+            'OSM道路等级': str,
+            '渠道': int,
+            '道路等级': str,
+            '道路等级Num': int,
+            '机动车道数': int,
+            '机非分隔': int,
+            '机动车道宽度': float,
+            '非机动车道宽度': float
+        }
+        
+        for i in range(rows):
+            for j in range(cols):
+                header = headers[j]
+                item = table.item(i, j)
+                text = item.text().strip() if item else ""
+                
+                if header in type_mapping:
+                    target_type = type_mapping[header]
+                    new_val = text
+                    
+                    if target_type == str:
+                        # 字符串不允许为空 (根据需求: 不允许存在空值)
+                        if not text:
+                            # 可以在这里报错，或者设置默认值? 
+                            # 用户说 "不允许存在空值"，这里暂时不强制阻断，但可以设为默认 'unknown' 或保持空让 processor 报错
+                            pass
+                        new_val = text
+                    
+                    elif target_type == int:
+                        # 尝试转int
+                        try:
+                            # 先转float处理 3.0
+                            val_float = float(text)
+                            new_val = str(int(val_float))
+                        except ValueError:
+                            # 转换失败 (可能是空或非法字符)，设为 0 (或其他默认值)
+                            new_val = "0"
+                            
+                    elif target_type == float:
+                        try:
+                            val_float = float(text)
+                            new_val = str(val_float)
+                        except ValueError:
+                            new_val = "0.0"
+                    
+                    # 更新 UI
+                    if item:
+                        item.setText(new_val)
+                    else:
+                        item = QTableWidgetItem(new_val)
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                        table.setItem(i, j, item)
+
+    def export_reference_files(self):
+        """导出参考文件 (默认资源文件)，后缀增加 -样式"""
+        dir_path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.last_config_dir)
+        if dir_path:
+            try:
+                # 1. Node Map
+                src_path = self.DEFAULT_NODE_MAP
+                if os.path.exists(src_path):
+                    dst_path = os.path.join(dir_path, "节点表头映射关系-样式.xlsx")
+                    pd.read_excel(src_path).to_excel(dst_path, index=False)
+
+                # 2. Link Map
+                src_path = self.DEFAULT_LINK_MAP
+                if os.path.exists(src_path):
+                    dst_path = os.path.join(dir_path, "路网表头映射关系-样式.xlsx")
+                    pd.read_excel(src_path).to_excel(dst_path, index=False)
+
+                # 3. Attr Map
+                src_path = self.DEFAULT_ATTR_MAP
+                if os.path.exists(src_path):
+                    dst_path = os.path.join(dir_path, "路网字段属性映射关系-样式.xlsx")
+                    pd.read_excel(src_path).to_excel(dst_path, index=False)
+
+                QMessageBox.information(self, "成功", "参考文件已导出！")
+            except Exception as e:
+                QMessageBox.critical(self, "错误", f"导出失败: {e}")
+
+    def save_table_to_file(self, table, file_path, force_string=False):
+        df = self.get_table_data(table, force_string=force_string)
         df.to_excel(file_path, index=False)
 
-    def get_table_data(self, table):
+    def get_table_data(self, table, force_string=False):
+        """
+        从 QTableWidget 获取数据。
+        force_string: 是否强制所有内容为字符串 (用于表头映射)
+        """
         rows = table.rowCount()
         cols = table.columnCount()
         headers = [table.horizontalHeaderItem(j).text() for j in range(cols)]
@@ -734,14 +921,38 @@ class MainWindow(QMainWindow):
             row_data = []
             for j in range(cols):
                 item = table.item(i, j)
-                row_data.append(item.text() if item else "")
+                text = item.text() if item else ""
+                
+                if force_string:
+                    val = text # 保持字符串，允许空
+                else:
+                    # 尝试还原数值类型 (用于属性映射)
+                    try:
+                        # 优先尝试转int (如果是纯数字)
+                        if text.isdigit() or (text.startswith('-') and text[1:].isdigit()):
+                             val = int(text)
+                        else:
+                            # 尝试转float
+                            val = float(text)
+                            # 如果转float后是整数 (如 3.0), 转回int
+                            if val.is_integer():
+                                val = int(val)
+                    except ValueError:
+                        val = text # 保持字符串
+                    
+                    if text == "":
+                        val = None
+                    
+                row_data.append(val)
             data.append(row_data)
         return pd.DataFrame(data, columns=headers)
 
     def update_processor_mappings(self):
-        node_df = self.get_table_data(self.node_table)
-        link_df = self.get_table_data(self.link_table)
-        attr_df = self.get_table_data(self.attr_table)
+        # 表头映射强制用字符串
+        node_df = self.get_table_data(self.node_table, force_string=True)
+        link_df = self.get_table_data(self.link_table, force_string=True)
+        # 属性映射用推断类型
+        attr_df = self.get_table_data(self.attr_table, force_string=False)
         
         return self.processor.update_mappings(node_df, link_df, attr_df)
 
@@ -843,6 +1054,18 @@ class MainWindow(QMainWindow):
             self.start_worker_task('preview_raw')
 
     def start_worker_task(self, task_type):
+        # 防御性编程: 如果已有正在运行的任务，先强制停止
+        if hasattr(self, 'worker') and self.worker is not None:
+             # 如果 worker 还在，即使 not isRunning()，也应该清理
+             if self.worker.isRunning():
+                 try:
+                    self.worker.finished_signal.disconnect(self.on_task_finished)
+                 except TypeError:
+                    pass
+                 self.worker.terminate()
+                 self.worker.wait()
+             self.worker = None
+
         # 收集通用参数
         mode_id = self.mode_bg.checkedId()
         modes = {1: 'online', 2: 'osm', 3: 'csv'}
@@ -891,6 +1114,13 @@ class MainWindow(QMainWindow):
                  QMessageBox.warning(self, "提示", "请选择至少一个区块。")
                  return
 
+        # 获取自定义坐标系
+        target_crs = None
+        if hasattr(self, 'crs_input'):
+             epsg_code = self.crs_input.text().strip()
+             if epsg_code:
+                 target_crs = epsg_code # Pass string "EPSG:xxxx" or just "xxxx"
+
         # Prepare kwargs
         task_kwargs = {
             'processor': self.processor,
@@ -898,11 +1128,12 @@ class MainWindow(QMainWindow):
             'input_val': input_val,
             'output_dir': output_dir,
             'encoding': encoding,
-            'filter_criteria': selected_block_ids
+            'filter_criteria': selected_block_ids,
+            'target_crs': target_crs
         }
         
         # UI State Update
-        self.set_ui_busy(True)
+        self.set_ui_busy(True, task_type)
         self.log_area.clear()
         self.current_log_widget = self.log_area # Shared log area
         
@@ -911,18 +1142,111 @@ class MainWindow(QMainWindow):
         self.worker.finished_signal.connect(self.on_task_finished)
         self.worker.start()
 
-    def set_ui_busy(self, busy):
-        self.run_btn.setEnabled(not busy and self.format_conversion_checkbox.isChecked())
-        self.export_filtered_btn.setEnabled(not busy)
-        self.preview_btn.setEnabled(not busy)
+    def stop_current_worker(self):
+        """停止当前运行的Worker线程"""
+        worker_exists = hasattr(self, 'worker') and self.worker is not None
+        
+        if worker_exists:
+            is_running = self.worker.isRunning()
+            # self.log(f"Debug: Stop requested. Worker: {self.worker}, Running: {is_running}")
+            
+            if is_running:
+                self.log("正在停止任务...")
+                # 断开信号连接，防止 ghost 信号触发 on_task_finished
+                try:
+                    self.worker.finished_signal.disconnect(self.on_task_finished)
+                except TypeError:
+                    pass # 如果未连接，忽略错误
+
+                self.worker.terminate() # 强制终止 (简单粗暴但有效)
+                self.worker.wait()
+                self.log("任务已强制停止。")
+            else:
+                self.log("任务已经结束。")
+            
+            # 无论是否正在运行，只要 worker 存在，停止后都重置
+            self.worker = None 
+            self.set_ui_busy(False)
+        else:
+            self.log("没有正在运行的任务。")
+
+    def set_ui_busy(self, busy, task_type=None):
+        """
+        根据任务类型设置UI繁忙状态
+        busy: True/False
+        task_type: 'preprocess' (Acquisition) 或 'filter_and_export' (Export) 等
+        """
+        # CSS Styles
+        disabled_style = "color: gray; background-color: #f0f0f0;"
+        normal_style = ""
+        stop_style = "background-color: #e74c3c; color: white; font-weight: bold;"
+        
+        is_preprocess_task = task_type in ['preprocess', 'export_raw', 'preview_raw']
+        is_export_task = task_type in ['filter_and_export']
+
         if busy:
+            # Global Disable (except relevant Stop button)
+            self.run_btn.setEnabled(False)
+            self.export_filtered_btn.setEnabled(False)
+            self.preview_btn.setEnabled(False)
+            
+            # Apply disabled style
+            self.run_btn.setStyleSheet(disabled_style)
+            self.export_filtered_btn.setStyleSheet(disabled_style)
+
+            # Enable specific STOP button
+            if is_preprocess_task:
+                if hasattr(self, 'btn_stop_preprocess'): 
+                    self.btn_stop_preprocess.setEnabled(True)
+                    self.btn_stop_preprocess.setStyleSheet(stop_style)
+                if hasattr(self, 'btn_stop_export'): 
+                    self.btn_stop_export.setEnabled(False)
+                    self.btn_stop_export.setStyleSheet(disabled_style)
+            
+            elif is_export_task:
+                if hasattr(self, 'btn_stop_preprocess'): 
+                    self.btn_stop_preprocess.setEnabled(False)
+                    self.btn_stop_preprocess.setStyleSheet(disabled_style)
+                if hasattr(self, 'btn_stop_export'): 
+                    self.btn_stop_export.setEnabled(True)
+                    self.btn_stop_export.setStyleSheet(stop_style)
+            
+            # Show Progress
             self.progress_bar.show()
             self.progress_bar.setRange(0, 0) # indeterminate
+            
         else:
+            # Reset Normal State
+            self.run_btn.setEnabled(self.format_conversion_checkbox.isChecked())
+            self.export_filtered_btn.setEnabled(True)
+            self.preview_btn.setEnabled(True)
+            
+            # Reset Styles
+            self.run_btn.setStyleSheet(normal_style)
+            self.export_filtered_btn.setStyleSheet(normal_style)
+            
+            # Disable Stop Buttons
+            if hasattr(self, 'btn_stop_preprocess'): 
+                self.btn_stop_preprocess.setEnabled(False)
+                self.btn_stop_preprocess.setStyleSheet(disabled_style)
+            if hasattr(self, 'btn_stop_export'): 
+                self.btn_stop_export.setEnabled(False)
+                self.btn_stop_export.setStyleSheet(disabled_style)
+                
+            # Hide Progress
             self.progress_bar.hide()
 
     def on_task_finished(self, success, result):
+        # 检查信号发送者是否为当前 worker (防止旧 worker 的延迟信号干扰)
+        if hasattr(self, 'worker') and self.worker is not None:
+             if self.sender() != self.worker:
+                 return
+
         self.set_ui_busy(False)
+        # 任务完成后也要重置 worker，防止干扰
+        if hasattr(self, 'worker'):
+            self.worker = None
+            
         if success:
             if result == "处理成功":
                 self.update_stats_table()
@@ -1055,13 +1379,9 @@ class MainWindow(QMainWindow):
         # Removed
         pass
 
-    def update_attribute_tables(self):
-        """Populate the attribute tables based on SELECTED blocks in the left panel."""
-        if self.processor.processed_links_gdf is None:
-            QMessageBox.warning(self, "提示", "请先进行数据预处理。")
-            return
-
-        # 1. Get selected blocks
+    def start_update_attribute_tables_thread(self):
+        """Start async thread to update attribute tables."""
+        # 1. Get selected block IDs (UI operation, must be done in main thread)
         selected_block_ids = []
         for i in range(self.block_table_model.rowCount()):
             index = self.block_table_model.index(i, 0)
@@ -1072,38 +1392,61 @@ class MainWindow(QMainWindow):
                     selected_block_ids.append(int(self.block_table_model.item(i, 1).text()))
         
         if not selected_block_ids:
-            QMessageBox.warning(self, "提示", "请至少选择一个区块。")
+            QMessageBox.warning(self, "提示", "请先选择至少一个区块。")
+            return
+
+        # 2. UI State
+        self.btn_update_attr.setEnabled(False)
+        self.attr_progress_bar.show()
+        # Set range to 0-0 for indeterminate progress (busy indicator)
+        self.attr_progress_bar.setRange(0, 0) 
+        
+        # 3. Start Thread
+        self.attr_worker = WorkerThread('update_attr_table', 
+                                        processor=self.processor, 
+                                        filter_criteria=selected_block_ids)
+        self.attr_worker.finished_signal.connect(self.on_attr_update_finished)
+        self.attr_worker.start()
+
+    def on_attr_update_finished(self, success, result):
+        self.btn_update_attr.setEnabled(True)
+        self.attr_progress_bar.hide()
+        
+        if success:
+            # Result contains (link_data, node_data)
+            link_data, node_data = result
+            self._populate_table_widget(self.link_attr_table, link_data)
+            self._populate_table_widget(self.node_attr_table, node_data)
+        else:
+            QMessageBox.warning(self, "错误", f"更新属性表失败: {result}")
+
+    def _populate_table_widget(self, table, df):
+        """Helper to populate QTableWidget from DataFrame."""
+        if df is None or df.empty:
+            table.setRowCount(0)
+            table.setColumnCount(0)
             return
             
-        # 2. Filter Data
-        links = self.processor.processed_links_gdf[self.processor.processed_links_gdf['区块ID'].isin(selected_block_ids)]
-        nodes = self.processor.processed_nodes_gdf[self.processor.processed_nodes_gdf['区块ID'].isin(selected_block_ids)]
-        
-        # 3. Populate Tables
-        # Drop geometry column for display
-        links_display = links.drop(columns='geometry') if 'geometry' in links.columns else links
-        nodes_display = nodes.drop(columns='geometry') if 'geometry' in nodes.columns else nodes
-        
-        self._populate_table_widget(self.link_attr_table, links_display)
-        self._populate_table_widget(self.node_attr_table, nodes_display)
-        
-    def _populate_table_widget(self, table, df):
-        table.setRowCount(0)
-        table.setColumnCount(len(df.columns))
+        table.setRowCount(df.shape[0])
+        table.setColumnCount(df.shape[1])
         table.setHorizontalHeaderLabels(df.columns.astype(str))
-        table.setRowCount(len(df))
         
-        # Performance optimization: Disable sorting while populating
+        # Disable sorting temporarily for speed
         table.setSortingEnabled(False)
         
-        for i in range(len(df)):
-            for j in range(len(df.columns)):
+        for i in range(df.shape[0]):
+            for j in range(df.shape[1]):
                 val = df.iat[i, j]
-                item = QTableWidgetItem(str(val))
+                text = str(val) if pd.notnull(val) else ""
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 table.setItem(i, j, item)
-        
+                
         table.setSortingEnabled(True)
+
+    def update_attribute_tables(self):
+        # Deprecated: Logic moved to worker thread
+        pass
 
     def maximize_attr_table(self):
         """Toggle maximize/restore for attribute table."""

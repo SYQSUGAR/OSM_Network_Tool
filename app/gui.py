@@ -6,8 +6,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                              QTextEdit, QFileDialog, QProgressBar, QMessageBox, 
                              QGroupBox, QFrame, QRadioButton, QButtonGroup, QTabWidget, QStackedWidget, QCheckBox,
-                             QTableView, QHeaderView, QSplitter, QComboBox, QColorDialog, QTableWidget, QTableWidgetItem)
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor
+                             QTableView, QHeaderView, QSplitter, QComboBox, QColorDialog, QTableWidget, QTableWidgetItem,
+                             QCompleter)
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel
 from shapely import wkt
 import geopandas as gpd
@@ -185,7 +186,191 @@ class WorkerThread(QThread):
             import traceback
             self.log_signal.emit(traceback.format_exc())
             self.finished_signal.emit(False, str(e))
+class CoordSysSelector(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        # 1. 初始化原始数据源
+        self.geo_coords = []
+        self.proj_coords = []
+        self.favorites = []
+        
+        self.init_data()
+        self.init_ui()
+        self.refresh_model() # 首次渲染下拉列表
 
+    def init_data(self):
+        """初始化所有坐标系的底层数据"""
+        # --- 地理坐标系 ---
+        self.geo_coords = [
+            "WGS 84 (EPSG:4326) - 国际标准GPS坐标",
+            "CGCS2000 (EPSG:4490) - 2000国家大地坐标系",
+            "Beijing 1954 (EPSG:4214) - 北京54坐标系",
+            "Xian 1980 (EPSG:4610) - 西安80坐标系",
+            "GCJ-02 - 国测局火星坐标系 (高德/腾讯)",
+            "BD-09 - 百度坐标系"
+        ]
+
+        # --- 投影坐标系 ---
+        self.proj_coords = [
+            "WGS 84 / Pseudo-Mercator (EPSG:3857) - 网页地图通用"
+        ]
+        # 批量生成 WGS 84 UTM
+        for zone in range(1, 61):
+            self.proj_coords.append(f"WGS 84 / UTM zone {zone}N (EPSG:326{zone:02d})")
+        for zone in range(1, 61):
+            self.proj_coords.append(f"WGS 84 / UTM zone {zone}S (EPSG:327{zone:02d})")
+        # 批量生成 CGCS2000 高斯克吕格
+        epsg_cgcs_3d_start = 4513
+        for zone in range(25, 46):
+            self.proj_coords.append(f"CGCS2000 / 3-degree Gauss-Kruger zone {zone} (EPSG:{epsg_cgcs_3d_start})")
+            epsg_cgcs_3d_start += 1
+
+        # --- 默认的常用坐标系 ---
+        self.favorites = [
+            "WGS 84 (EPSG:4326) - 国际标准GPS坐标",
+            "CGCS2000 (EPSG:4490) - 2000国家大地坐标系",
+            "WGS 84 / Pseudo-Mercator (EPSG:3857) - 网页地图通用",
+            "GCJ-02 - 国测局火星坐标系 (高德/腾讯)",
+            "BD-09 - 百度坐标系"
+        ]
+
+    def init_ui(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        label = QLabel("坐标参考系:")
+        label.setFixedWidth(75)
+        
+        # 核心下拉框
+        self.combo = QComboBox()
+        self.combo.setEditable(True) 
+        self.combo.setMinimumWidth(360)
+        self.combo.setMaxVisibleItems(15)
+        self.combo.lineEdit().setPlaceholderText("输入 EPSG、UTM或名称搜索...")
+        
+        # 核心模型与补全器
+        self.model = QStandardItemModel()
+        self.combo.setModel(self.model)
+        
+        self.completer = QCompleter(self.model, self)
+        self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.combo.setCompleter(self.completer)
+
+        # 收藏按钮
+        self.fav_btn = QPushButton("☆ 收藏")
+        self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fav_btn.setFixedWidth(80)
+        self.fav_btn.setStyleSheet("""
+            QPushButton { background-color: transparent; border: 1px solid #dcdde1; border-radius: 4px; color: #7f8fa6; font-weight: bold;}
+            QPushButton:hover { background-color: #f5f6fa; }
+        """)
+
+        layout.addWidget(label)
+        layout.addWidget(self.combo)
+        layout.addWidget(self.fav_btn)
+
+        # 绑定事件
+        self.combo.currentTextChanged.connect(self.check_favorite_status)
+        self.fav_btn.clicked.connect(self.toggle_favorite)
+
+    def refresh_model(self):
+        """重新构建下拉列表（包含常用、地理、投影三个分区）"""
+        # 记录当前输入的文字，防止刷新时被清空
+        current_text = self.combo.currentText()
+        
+        self.model.clear()
+
+        # 1. 常用坐标系区
+        if self.favorites:
+            self.add_category("─── ⭐ 常用坐标系 ───")
+            for item in self.favorites:
+                self.add_item(item)
+                
+        # 2. 地理坐标系区
+        self.add_category("─── 🌍 地理坐标系 (Geographic) ───")
+        for item in self.geo_coords:
+            self.add_item(item)
+            
+        # 3. 投影坐标系区
+        self.add_category("─── 🗺️ 投影坐标系 (Projected) ───")
+        for item in self.proj_coords:
+            self.add_item(item)
+
+        # 恢复之前的文字并更新按钮状态
+        self.combo.setCurrentText(current_text)
+        self.check_favorite_status(current_text)
+
+    def add_category(self, text):
+        """添加禁用的分类标题"""
+        item = QStandardItem(text)
+        item.setEnabled(False) 
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        font = QFont()
+        font.setBold(True)
+        item.setFont(font)
+        item.setBackground(QColor("#f1f2f6"))
+        item.setForeground(QColor("#2f3640"))
+        self.model.appendRow(item)
+
+    def add_item(self, text):
+        """添加可选项（加缩进）"""
+        item = QStandardItem("  " + text) # 前置空格产生缩进美感
+        item.setData(text, Qt.ItemDataRole.UserRole)
+        self.model.appendRow(item)
+
+    def check_favorite_status(self, text):
+        """检查当前输入的坐标系是否在常用列表中，动态改变按钮样式"""
+        clean_text = text.strip() # 去除可能带有的缩进空格
+        if not clean_text:
+            self.fav_btn.setText("☆ 收藏")
+            self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px;")
+            return
+
+        if clean_text in self.favorites:
+            self.fav_btn.setText("★ 已收藏")
+            self.fav_btn.setStyleSheet("color: #e67e22; border: 1px solid #e67e22; border-radius: 4px; background-color: #fff3e0;")
+        else:
+            self.fav_btn.setText("☆ 收藏")
+            self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px; background-color: transparent;")
+
+    def toggle_favorite(self):
+        """点击收藏/取消收藏按钮时的逻辑"""
+        clean_text = self.combo.currentText().strip()
+        if not clean_text:
+            return
+
+        if clean_text in self.favorites:
+            self.favorites.remove(clean_text) # 取消收藏
+        else:
+            self.favorites.append(clean_text) # 添加收藏
+
+        # 刷新列表模型以实时更新“常用坐标系”区域
+        self.refresh_model()
+
+    def get_selected_epsg(self):
+        """提取 EPSG 数值用于代码转换，如 4326"""
+        text = self.combo.currentText()
+        if "EPSG:" in text:
+            try:
+                return int(text.split("EPSG:")[1].split(")")[0].strip())
+            except (IndexError, ValueError):
+                pass
+        return text.strip()
+
+    # ====== 新增：用于保存用户偏好的接口 ======
+    def get_favorites_list(self):
+        """导出当前的常用列表，以便存入 settings.json"""
+        return self.favorites
+        
+    def load_favorites_list(self, fav_list):
+        """从 settings.json 加载用户之前保存的常用列表"""
+        if isinstance(fav_list, list):
+            self.favorites = fav_list
+            self.refresh_model()
+            
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -499,22 +684,9 @@ class MainWindow(QMainWindow):
         # Export Controls Row (CRS + Export + Stop)
         export_ctrl_layout = QHBoxLayout()
         
-        export_ctrl_layout.addWidget(QLabel("导出坐标系:"))
-        
-        # 坐标系下拉选择框
-        self.crs_combo = QComboBox()
-        self.crs_combo.setEditable(False) # 用户不能直接编辑下拉框文本，但可以通过输入框修改
-        self.crs_combo.addItems(["WGS84 (4326)", "Web Mercator (3857)", "Auto (UTM)", "Custom"])
-        self.crs_combo.currentIndexChanged.connect(self.on_crs_combo_changed)
-        self.crs_combo.setFixedWidth(120)
-        export_ctrl_layout.addWidget(self.crs_combo)
-
-        # 坐标系输入框 (用于显示EPSG代码或手动输入)
-        self.crs_input = QLineEdit()
-        self.crs_input.setPlaceholderText("EPSG Code")
-        self.crs_input.setText("4326") # 默认 WGS84
-        self.crs_input.setFixedWidth(80)
-        export_ctrl_layout.addWidget(self.crs_input)
+        # 使用自定义的坐标系选择器
+        self.coord_selector = CoordSysSelector()
+        export_ctrl_layout.addWidget(self.coord_selector)
 
         # Export Button (Always visible/enabled if conversion off?)
         self.export_filtered_btn = QPushButton("导出数据")
@@ -1182,20 +1354,17 @@ class MainWindow(QMainWindow):
 
         # 获取自定义坐标系
         target_crs = "EPSG:4326" # Default WGS84
-        if hasattr(self, 'crs_input'):
-             epsg_code = self.crs_input.text().strip()
-             if epsg_code:
-                 # Check for "Auto" (case insensitive)
-                 if epsg_code.lower() == 'auto':
+        if hasattr(self, 'coord_selector'):
+             raw_val = self.coord_selector.get_selected_epsg()
+             if raw_val:
+                 if isinstance(raw_val, int):
+                     target_crs = f"EPSG:{raw_val}"
+                 elif str(raw_val).strip().lower() == 'auto':
                      target_crs = 'Auto'
-                 # Check if user entered just a number or full EPSG string
-                 elif epsg_code.isdigit():
-                     target_crs = f"EPSG:{epsg_code}"
+                 elif str(raw_val).strip().isdigit():
+                     target_crs = f"EPSG:{str(raw_val).strip()}"
                  else:
-                     target_crs = epsg_code 
-             else:
-                 # If empty, fallback to 4326 as requested
-                 target_crs = "EPSG:4326"
+                     target_crs = str(raw_val).strip()
 
         # Prepare kwargs
         task_kwargs = {
@@ -1498,23 +1667,6 @@ class MainWindow(QMainWindow):
         # Deprecated: Logic moved to worker thread
         pass
 
-    def on_crs_combo_changed(self, index):
-        """Handle CRS selection change."""
-        text = self.crs_combo.currentText()
-        if "WGS84" in text:
-            self.crs_input.setText("4326")
-            self.crs_input.setEnabled(True)
-        elif "Web Mercator" in text:
-            self.crs_input.setText("3857")
-            self.crs_input.setEnabled(True)
-        elif "Auto" in text:
-            self.crs_input.setText("Auto")
-            self.crs_input.setEnabled(False) # Auto mode doesn't need input
-        elif "Custom" in text:
-            self.crs_input.clear()
-            self.crs_input.setEnabled(True)
-            self.crs_input.setPlaceholderText("e.g. 32650")
-
     def maximize_attr_table(self):
         """Toggle maximize/restore for attribute table."""
         is_max = self.btn_maximize_attr.isChecked()
@@ -1647,7 +1799,11 @@ class MainWindow(QMainWindow):
                 self.city_input.setText(data.get('city', ''))
                 self.out_input.setText(data.get('out_dir', 'output'))
                 self.format_conversion_checkbox.setChecked(data.get('fmt_conv', True))
-                # Restore others...
+                
+                # Restore favorites
+                favs = data.get('crs_favorites')
+                if favs and hasattr(self, 'coord_selector'):
+                    self.coord_selector.load_favorites_list(favs)
         except: pass
 
     def init_defaults(self):
@@ -1662,6 +1818,11 @@ class MainWindow(QMainWindow):
             'out_dir': self.out_input.text(),
             'fmt_conv': self.format_conversion_checkbox.isChecked()
         }
+        
+        # Save favorites
+        if hasattr(self, 'coord_selector'):
+            data['crs_favorites'] = self.coord_selector.get_favorites_list()
+            
         with open(self.settings_file, 'w') as f:
             json.dump(data, f)
         event.accept()

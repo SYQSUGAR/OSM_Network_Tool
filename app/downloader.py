@@ -30,6 +30,7 @@ def process_from_osm_file(osm_file_path, output_directory, log_callback=print):
         os.makedirs(output_directory)
 
     net = og.getNetFromFile(osm_file_path, network_types=('auto',), POI=False)
+    og.consolidateComplexIntersections(net, auto_identify=True)
     og.outputNetToCSV(net, output_folder=output_directory)
 
     link_csv_path = os.path.join(output_directory, 'link.csv')

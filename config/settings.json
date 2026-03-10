@@ -3,7 +3,7 @@
     "city": "榆林",
     "out_dir": "E:\\1工作\\科研项目\\软件开发\\爬取代码\\output",
     "fmt_conv": true,
-    "osm_file": "E:/1工作/科研项目/软件开发/爬取代码/QuanZhou.osm",
+    "osm_file": "E:/1工作/科研项目/软件开发/爬取代码/Yulingis.osm",
     "link_file": "E:/1工作/科研项目/软件开发/爬取代码/output/link.csv",
     "node_file": "E:/1工作/科研项目/软件开发/爬取代码/output/node.csv",
     "last_mode_id": 3,
@@ -15,5 +15,5 @@
         "BD-09 - 百度坐标系",
         "WGS 84 / UTM zone 49N (EPSG:32649)"
     ],
-    "last_crs_selection": "  WGS 84 / UTM zone 49N (EPSG:32649)"
+    "last_crs_selection": "  WGS 84 (EPSG:4326) - 国际标准GPS坐标"
 }

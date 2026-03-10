@@ -1212,8 +1212,15 @@ class MainWindow(QMainWindow):
     # =============================================================================================
     
     def on_format_conversion_toggled(self, checked):
-        # 1. Start Preprocessing Button
-        self.run_btn.setEnabled(checked)
+        # ================= 核心修复 1：检查后台是否有任务正在运行 =================
+        is_busy = hasattr(self, 'worker') and self.worker is not None
+        
+        # 只有在非繁忙状态下，才允许复选框去改变执行类按钮的启用状态
+        if not is_busy:
+            self.run_btn.setEnabled(checked)
+            self.export_filtered_btn.setEnabled(True)
+            self.preview_btn.setEnabled(True)
+        # =====================================================================
         
         # 2. Filtering Table & Stats (Disabled when unchecked)
         self.stats_widget.setEnabled(checked)
@@ -1226,9 +1233,6 @@ class MainWindow(QMainWindow):
         
         # 4. Log Area (Always Enabled)
         self.log_area.setEnabled(True)
-        
-        # 5. Export Button (Always Enabled)
-        self.export_filtered_btn.setEnabled(True)
 
     def start_preprocess(self):
         # 只有在启用格式转换时才能点击此按钮
@@ -1438,18 +1442,14 @@ class MainWindow(QMainWindow):
     def set_ui_busy(self, busy, task_type=None):
         """
         根据任务类型设置UI繁忙状态
-        busy: True/False
-        task_type: 'preprocess' (Acquisition) 或 'filter_and_export' (Export) 等
         """
-        # 修改任务类型判断逻辑
-        # 'export_raw_with_stop' 是为了区分原始导出操作，它应该被视为导出任务
         is_preprocess_task = task_type in ['preprocess', 'preview_raw']
-        # 注意: 'export_raw' 之前被归类为 preprocess，现在如果它被明确为导出任务，应该移到下面
-        # 但 'export_raw' 在没有格式转换时是直接导出，逻辑上它是一个“导出”操作
-        
         is_export_task = task_type in ['filter_and_export', 'export_preview_current', 'export_raw_with_stop', 'export_raw']
 
         if busy:
+            # ====== 核心修复 2：任务运行时，锁定格式转换复选框，禁止用户在运行中途更改 ======
+            self.format_conversion_checkbox.setEnabled(False)
+            
             # 1. 在任务运行期间，禁用所有“开始”类按钮
             self.run_btn.setEnabled(False)
             self.export_filtered_btn.setEnabled(False)
@@ -1457,16 +1457,12 @@ class MainWindow(QMainWindow):
             
             # 2. 根据任务类型，仅启用对应的“停止”按钮
             if is_preprocess_task:
-                # 正在进行数据处理/获取
                 self.btn_stop_preprocess.setEnabled(True)
                 self.btn_stop_export.setEnabled(False)
             elif is_export_task:
-                # 正在进行导出操作
                 self.btn_stop_preprocess.setEnabled(False)
                 self.btn_stop_export.setEnabled(True)
             else:
-                # 其他可能的异步任务 (如生成预览、预览导出等)
-                # 默认逻辑: 如果没有明确分类，为了安全都禁用停止按钮，或根据需要扩展
                 self.btn_stop_preprocess.setEnabled(False)
                 self.btn_stop_export.setEnabled(False)
             
@@ -1475,6 +1471,9 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
             
         else:
+            # ====== 核心修复 3：任务结束后，解锁格式转换复选框 ======
+            self.format_conversion_checkbox.setEnabled(True)
+            
             # 3. 任务结束（正常或停止）后，恢复所有“开始”按钮
             self.run_btn.setEnabled(self.format_conversion_checkbox.isChecked())
             self.export_filtered_btn.setEnabled(True)
@@ -1649,10 +1648,19 @@ class MainWindow(QMainWindow):
         pass
 
     def start_update_attribute_tables_thread(self):
-        # ... 获取 selected_block_ids ...
+        """Start async thread to update attribute tables."""
+        # 1. 获取选中的区块ID (这就是缺失的那段代码)
+        selected_block_ids = []
+        for i in range(self.block_table_model.rowCount()):
+            index = self.block_table_model.index(i, 0)
+            container = self.block_table_view.indexWidget(index)
+            if container:
+                cb = container.layout().itemAt(0).widget()
+                if cb.isChecked():
+                    selected_block_ids.append(int(self.block_table_model.item(i, 1).text()))
+        
         if not selected_block_ids:
-            QMessageBox.warning(self, "提示", "请先选择至少一个区块。")
-            return
+            return  # 如果没有选中任何区块，直接返回即可
 
         # ====== 核心修复 5：启动属性更新前清理旧线程 ======
         if hasattr(self, 'attr_worker') and self.attr_worker is not None:
@@ -1663,12 +1671,12 @@ class MainWindow(QMainWindow):
             self.attr_worker = None
         # ==================================================
 
+        # 2. UI 状态更新
         self.btn_update_attr.setEnabled(False)
         self.attr_progress_bar.show()
-        # Set range to 0-0 for indeterminate progress (busy indicator)
         self.attr_progress_bar.setRange(0, 0) 
         
-        # 3. Start Thread
+        # 3. 启动后台线程
         self.attr_worker = WorkerThread('update_attr_table', 
                                         processor=self.processor, 
                                         filter_criteria=selected_block_ids)

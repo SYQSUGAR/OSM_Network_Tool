@@ -1308,17 +1308,14 @@ class MainWindow(QMainWindow):
             self.start_worker_task('preview_raw')
 
     def start_worker_task(self, task_type):
-        # 启动任务前先保存配置
         self.save_settings()
 
-        # 规范化任务类型映射
         actual_task_type = task_type
         if task_type == 'export_raw_with_stop':
             actual_task_type = 'export_raw'
         
-        # 防御性编程: 如果已有正在运行的任务，先强制停止
+        # ====== 核心修复 2：启动新任务前，安全清理旧 Worker ======
         if hasattr(self, 'worker') and self.worker is not None:
-             # 如果 worker 还在，即使 not isRunning()，也应该清理
              if self.worker.isRunning():
                  try:
                     self.worker.finished_signal.disconnect(self.on_task_finished)
@@ -1326,6 +1323,7 @@ class MainWindow(QMainWindow):
                     pass
                  self.worker.terminate()
                  self.worker.wait()
+             self.worker.deleteLater()  # 延迟安全删除
              self.worker = None
 
         # 收集通用参数
@@ -1412,30 +1410,28 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def stop_current_worker(self):
-        """停止当前运行的Worker线程"""
         worker_exists = hasattr(self, 'worker') and self.worker is not None
         
         if worker_exists:
             is_running = self.worker.isRunning()
-            # self.log(f"Debug: Stop requested. Worker: {self.worker}, Running: {is_running}")
             
             if is_running:
                 self.log("正在停止任务...")
-                # 断开信号连接，防止 ghost 信号触发 on_task_finished
                 try:
                     self.worker.finished_signal.disconnect(self.on_task_finished)
                 except TypeError:
-                    pass # 如果未连接，忽略错误
-
-                self.worker.terminate() # 强制终止 (简单粗暴但有效)
+                    pass
+                self.worker.terminate()
                 self.worker.wait()
                 self.log("任务已强制停止。")
             else:
                 self.log("任务已经结束。")
             
-            # 无论是否正在运行，只要 worker 存在，停止后都重置
+            # ====== 核心修复 3：手动停止时的安全释放 ======
+            self.worker.deleteLater()
             self.worker = None 
             self.set_ui_busy(False)
+            # ============================================
         else:
             self.log("没有正在运行的任务。")
 
@@ -1492,20 +1488,22 @@ class MainWindow(QMainWindow):
             self.progress_bar.hide()
 
     def on_task_finished(self, success, result):
-        # 检查信号发送者是否为当前 worker (防止旧 worker 的延迟信号干扰)
+        # 检查信号发送者是否为当前 worker
         if hasattr(self, 'worker') and self.worker is not None:
              if self.sender() != self.worker:
                  return
 
         self.set_ui_busy(False)
-        # 任务完成后也要重置 worker，防止干扰
-        if hasattr(self, 'worker'):
+        
+        # ====== 核心修复 1：安全释放主任务 Worker ======
+        if hasattr(self, 'worker') and self.worker is not None:
+            self.worker.deleteLater()  # 延迟安全删除底层 C++ 对象
             self.worker = None
+        # ===============================================
             
         if success:
             if result == "处理成功":
                 self.update_stats_table()
-                # 自动触发属性表更新 (使用当前默认选中的区块)
                 self.start_update_attribute_tables_thread()
                 QMessageBox.information(self, "成功", "预处理完成！")
             elif result == "preview_ready":
@@ -1651,22 +1649,20 @@ class MainWindow(QMainWindow):
         pass
 
     def start_update_attribute_tables_thread(self):
-        """Start async thread to update attribute tables."""
-        # 1. Get selected block IDs (UI operation, must be done in main thread)
-        selected_block_ids = []
-        for i in range(self.block_table_model.rowCount()):
-            index = self.block_table_model.index(i, 0)
-            container = self.block_table_view.indexWidget(index)
-            if container:
-                cb = container.layout().itemAt(0).widget()
-                if cb.isChecked():
-                    selected_block_ids.append(int(self.block_table_model.item(i, 1).text()))
-        
+        # ... 获取 selected_block_ids ...
         if not selected_block_ids:
             QMessageBox.warning(self, "提示", "请先选择至少一个区块。")
             return
 
-        # 2. UI State
+        # ====== 核心修复 5：启动属性更新前清理旧线程 ======
+        if hasattr(self, 'attr_worker') and self.attr_worker is not None:
+            if self.attr_worker.isRunning():
+                 self.attr_worker.terminate()
+                 self.attr_worker.wait()
+            self.attr_worker.deleteLater()
+            self.attr_worker = None
+        # ==================================================
+
         self.btn_update_attr.setEnabled(False)
         self.attr_progress_bar.show()
         # Set range to 0-0 for indeterminate progress (busy indicator)
@@ -1683,13 +1679,16 @@ class MainWindow(QMainWindow):
         self.btn_update_attr.setEnabled(True)
         self.attr_progress_bar.hide()
         
+        # ====== 核心修复 4：安全释放属性表更新 Worker ======
+        if hasattr(self, 'attr_worker') and self.attr_worker is not None:
+            self.attr_worker.deleteLater()
+            self.attr_worker = None
+        # ===================================================
+        
         if success:
-            # Result contains (link_data, node_data)
             link_data, node_data = result
-            # 使用自定义模型更新，瞬间完成渲染，不卡顿
             if link_data is not None:
                 self.link_attr_model.set_data(link_data)
-                # 触发视图更新
                 self.link_attr_model.layoutChanged.emit()
                 
             if node_data is not None:

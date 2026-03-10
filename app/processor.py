@@ -747,14 +747,6 @@ class DataProcessor:
 # 文件导出辅助函数 (Export Helper Functions)
 # ==============================================================================
 
-# ==============================================================================
-# 文件导出辅助函数 (Export Helper Functions)
-# ==============================================================================
-
-# ==============================================================================
-# 文件导出辅助函数 (Export Helper Functions)
-# ==============================================================================
-
 def _apply_crs(gdf, target_crs, log_callback):
     """辅助函数：处理坐标系投影"""
     if not target_crs:
@@ -799,54 +791,47 @@ def export_results(links_df, nodes_df, output_dir, is_raw=False, encoding='gbk',
     link_shp_path = os.path.join(output_dir, f"link_{suffix}.shp")
     node_shp_path = os.path.join(output_dir, f"node_{suffix}.shp")
     
-    # 导出 Excel（剥离 geometry 转换成 WKT 以免 Excel 报错）
+    # ================= 核心逻辑：在内存中统一执行坐标转换 =================
+    # 1. 强制转换为带坐标系的 GeoDataFrame
+    links_gdf = gpd.GeoDataFrame(links_df, geometry='geometry')
+    if links_gdf.crs is None: links_gdf.set_crs(epsg=4326, inplace=True)
+    
+    nodes_gdf = gpd.GeoDataFrame(nodes_df, geometry='geometry')
+    if nodes_gdf.crs is None: nodes_gdf.set_crs(epsg=4326, inplace=True)
+
+    # 2. 执行坐标投影（仅影响 geometry 列，原本的 x_coord, lon, lat 列不受任何影响）
+    links_gdf = _apply_crs(links_gdf, target_crs, log_callback)
+    nodes_gdf = _apply_crs(nodes_gdf, target_crs, log_callback)
+    # ======================================================================
+    
+    # 导出 SHP (必须使用真实的几何对象)
+    _create_shp(links_gdf.copy(), link_shp_path, encoding, "Link", log_callback)
+    _create_shp(nodes_gdf.copy(), node_shp_path, encoding, "Node", log_callback)
+    
+    # 导出 Excel (降级提取 WKT 纯字符串)
     log_callback(f"    正在写入: {os.path.basename(link_excel_path)}")
-    links_export = links_df.copy()
-    if 'geometry' in links_export.columns:
-        links_export['geometry'] = links_export['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
+    links_export = pd.DataFrame(links_gdf.drop(columns=['geometry'], errors='ignore'))
+    links_export['geometry'] = links_gdf['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
     links_export.to_excel(link_excel_path, index=False)
     
     log_callback(f"    正在写入: {os.path.basename(node_excel_path)}")
-    nodes_export = nodes_df.copy()
-    if 'geometry' in nodes_export.columns:
-        nodes_export['geometry'] = nodes_export['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
+    nodes_export = pd.DataFrame(nodes_gdf.drop(columns=['geometry'], errors='ignore'))
+    nodes_export['geometry'] = nodes_gdf['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
     nodes_export.to_excel(node_excel_path, index=False)
-    
-    # 导出 SHP (使用统一的精简函数)
-    _create_shp(links_df.copy(), link_shp_path, encoding, target_crs, "Link", log_callback)
-    _create_shp(nodes_df.copy(), node_shp_path, encoding, target_crs, "Node", log_callback)
     
     log_callback(f"  文件已保存至: {output_dir}")
     return output_dir
 
-def _create_shp(df, path, encoding, target_crs, name, log_callback):
-    """高度复用的 Shapefile 生成器"""
+def _create_shp(gdf, path, encoding, name, log_callback):
+    """高度精简的 SHP 生成器（因为传入的必定是标准的 GeoDataFrame）"""
     log_callback(f"    正在生成: {os.path.basename(path)}")
-    if 'geometry' not in df.columns:
-        log_callback(f"    警告: {name} DataFrame中无 geometry 列，跳过SHP生成。")
-        return
-        
     try:
-        # 万一有残留的字符串，保底转换，然后踢掉空值
-        def safe_wkt_load(x):
-            if isinstance(x, str):
-                try: return wkt.loads(x)
-                except: return None
-            return x
-            
-        df['geometry'] = df['geometry'].apply(safe_wkt_load)
-        valid_df = df.dropna(subset=['geometry']).copy()
-        
-        if valid_df.empty:
+        # 踢掉因异常导致为空的几何体，防止报错
+        valid_gdf = gdf.dropna(subset=['geometry']).copy()
+        if valid_gdf.empty:
             log_callback(f"    警告: {name} 没有有效的几何数据，跳过SHP生成。")
             return
             
-        # 生成 GeoDataFrame 并应用坐标系
-        gdf = gpd.GeoDataFrame(valid_df, geometry='geometry')
-        if gdf.crs is None:
-            gdf.set_crs(epsg=4326, inplace=True)
-            
-        gdf = _apply_crs(gdf, target_crs, log_callback)
-        gdf.to_file(path, encoding=encoding)
+        valid_gdf.to_file(path, encoding=encoding)
     except Exception as e:
         log_callback(f"    错误: 生成 {name} SHP失败 - {e}")

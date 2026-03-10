@@ -377,10 +377,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("OSM路网工具")
         self.resize(1200, 800)
         
-        self.last_osm_dir = "."
-        self.last_config_dir = "."
-        self.settings_file = "settings.json"
-        
         # Paths Setup
         # Determine Application Root
         if getattr(sys, 'frozen', False):
@@ -396,9 +392,23 @@ class MainWindow(QMainWindow):
             self.app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             self.base_path = self.app_root
 
+        self.last_osm_dir = "."
+        self.last_config_dir = "."
+        
         # 1. User Configs (Always external, writable) -> config/
         self.config_dir = os.path.join(self.app_root, "config")
         if not os.path.exists(self.config_dir): os.makedirs(self.config_dir)
+
+        # Settings file moved to config directory
+        self.settings_file = os.path.join(self.config_dir, "settings.json")
+        
+        # Migration: Move old settings.json to new location if exists
+        old_settings = os.path.join(self.app_root, "settings.json")
+        if os.path.exists(old_settings) and not os.path.exists(self.settings_file):
+            import shutil
+            try:
+                shutil.move(old_settings, self.settings_file)
+            except: pass
 
         # 2. Default Resources (Read-only templates) -> resources/
         # Try finding resources in sys._MEIPASS first (if bundled), then local
@@ -974,9 +984,18 @@ class MainWindow(QMainWindow):
             self.load_table_data(table, file)
 
     def restore_defaults(self, table, map_type):
-        reply = QMessageBox.question(self, "确认", "确定要恢复默认设置吗？这将覆盖当前修改。", 
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("确认")
+        msg_box.setText("确定要恢复默认设置吗？这将覆盖当前修改。")
+        msg_box.setIcon(QMessageBox.Icon.Question)
+        
+        # 添加自定义按钮
+        yes_btn = msg_box.addButton("确定", QMessageBox.ButtonRole.YesRole)
+        no_btn = msg_box.addButton("取消", QMessageBox.ButtonRole.NoRole)
+        
+        msg_box.exec()
+        
+        if msg_box.clickedButton() == yes_btn:
             path = ""
             if map_type == 'node': path = self.DEFAULT_NODE_MAP
             elif map_type == 'link': path = self.DEFAULT_LINK_MAP
@@ -1260,7 +1279,13 @@ class MainWindow(QMainWindow):
                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                             QMessageBox.StandardButton.No
                         )
-                        if reply == QMessageBox.StandardButton.No:
+                        # 设置按钮文本
+                        yes_btn = reply.button(QMessageBox.StandardButton.Yes)
+                        yes_btn.setText("继续")
+                        no_btn = reply.button(QMessageBox.StandardButton.No)
+                        no_btn.setText("取消")
+                        
+                        if reply.exec() == QMessageBox.StandardButton.No:
                             return
                 else:
                     # 选择了多个
@@ -1270,7 +1295,13 @@ class MainWindow(QMainWindow):
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                         QMessageBox.StandardButton.No
                     )
-                    if reply == QMessageBox.StandardButton.No:
+                    # 设置按钮文本
+                    yes_btn = reply.button(QMessageBox.StandardButton.Yes)
+                    yes_btn.setText("继续")
+                    no_btn = reply.button(QMessageBox.StandardButton.No)
+                    no_btn.setText("取消")
+                    
+                    if reply.exec() == QMessageBox.StandardButton.No:
                         return
 
             self.start_worker_task('filter_and_export')
@@ -1287,6 +1318,9 @@ class MainWindow(QMainWindow):
             self.start_worker_task('preview_raw')
 
     def start_worker_task(self, task_type):
+        # 启动任务前先保存配置
+        self.save_settings()
+
         # 规范化任务类型映射
         actual_task_type = task_type
         if task_type == 'export_raw_with_stop':
@@ -1481,6 +1515,8 @@ class MainWindow(QMainWindow):
         if success:
             if result == "处理成功":
                 self.update_stats_table()
+                # 自动触发属性表更新 (使用当前默认选中的区块)
+                self.start_update_attribute_tables_thread()
                 QMessageBox.information(self, "成功", "预处理完成！")
             elif result == "preview_ready":
                 QMessageBox.information(self, "成功", "预览数据已生成，请点击'更新地图'查看。")
@@ -1503,9 +1539,18 @@ class MainWindow(QMainWindow):
             headers = ["选择", "区块ID", "路段数", "路段占比", "节点数", "节点占比"]
             self.block_table_model.setHorizontalHeaderLabels(headers)
             
-            # Find largest block
-            max_links_idx = stats_df['路段数'].idxmax()
-            max_block_id = stats_df.loc[max_links_idx, '区块ID']
+            # 按路段数降序排列
+            stats_df = stats_df.sort_values(by='路段数', ascending=False)
+            # 重置索引，保证 iterrows 顺序正确
+            stats_df = stats_df.reset_index(drop=True)
+
+            # Find largest block (Original logic might be affected by reset_index if not careful, 
+            # but we just need the ID which is in the row)
+            if not stats_df.empty:
+                max_links_idx = stats_df['路段数'].idxmax()
+                max_block_id = stats_df.loc[max_links_idx, '区块ID']
+            else:
+                max_block_id = -1
             
             for i, row in stats_df.iterrows():
                 items = [
@@ -1531,7 +1576,12 @@ class MainWindow(QMainWindow):
                     cb.setChecked(False)
                     
                 w = QWidget(); l = QHBoxLayout(w); l.addWidget(cb); l.setAlignment(Qt.AlignmentFlag.AlignCenter); l.setContentsMargins(0,0,0,0)
-                self.block_table_view.setIndexWidget(self.block_table_model.index(i, 0), w)
+                # 使用 row count - 1 作为索引，确保添加到最新的一行
+                # 因为 iterrows 的 index 是原始 index (如果未重置)，或者重置后的 index
+                # 但 model.appendRow 是追加到最后。
+                # 最安全的方式是直接用当前 model 的行数
+                current_row = self.block_table_model.rowCount() - 1
+                self.block_table_view.setIndexWidget(self.block_table_model.index(current_row, 0), w)
         else:
             self.block_table_model.clear()
 
@@ -1793,18 +1843,63 @@ class MainWindow(QMainWindow):
     def load_settings(self):
         if not os.path.exists(self.settings_file): return
         try:
-            with open(self.settings_file, 'r') as f:
+            with open(self.settings_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 self.last_osm_dir = data.get('last_osm_dir', '.')
                 self.city_input.setText(data.get('city', ''))
                 self.out_input.setText(data.get('out_dir', 'output'))
                 self.format_conversion_checkbox.setChecked(data.get('fmt_conv', True))
                 
+                # Restore File Inputs
+                self.osm_file_input.setText(data.get('osm_file', ''))
+                self.link_file_input.setText(data.get('link_file', ''))
+                self.node_file_input.setText(data.get('node_file', ''))
+                
+                # Restore Selected Mode
+                last_mode_id = data.get('last_mode_id', 1)
+                # Check the corresponding radio button
+                btn = self.mode_bg.button(last_mode_id)
+                if btn:
+                    btn.setChecked(True)
+                    self.on_mode_changed(last_mode_id)
+                
                 # Restore favorites
                 favs = data.get('crs_favorites')
                 if favs and hasattr(self, 'coord_selector'):
                     self.coord_selector.load_favorites_list(favs)
-        except: pass
+                
+                # Restore last CRS selection
+                last_crs = data.get('last_crs_selection')
+                if last_crs and hasattr(self, 'coord_selector'):
+                    self.coord_selector.combo.setCurrentText(last_crs)
+                    self.coord_selector.check_favorite_status(last_crs)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+
+    def save_settings(self):
+        """保存当前用户配置到 settings.json"""
+        try:
+            data = {
+                'last_osm_dir': self.last_osm_dir,
+                'city': self.city_input.text(),
+                'out_dir': self.out_input.text(),
+                'fmt_conv': self.format_conversion_checkbox.isChecked(),
+                'osm_file': self.osm_file_input.text(),
+                'link_file': self.link_file_input.text(),
+                'node_file': self.node_file_input.text(),
+                'last_mode_id': self.mode_bg.checkedId()
+            }
+            
+            # Save favorites and current selection
+            if hasattr(self, 'coord_selector'):
+                data['crs_favorites'] = self.coord_selector.get_favorites_list()
+                data['last_crs_selection'] = self.coord_selector.combo.currentText()
+                
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error saving settings: {e}")
 
     def init_defaults(self):
         # Trigger toggle logic
@@ -1812,19 +1907,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         # Save settings on exit
-        data = {
-            'last_osm_dir': self.last_osm_dir,
-            'city': self.city_input.text(),
-            'out_dir': self.out_input.text(),
-            'fmt_conv': self.format_conversion_checkbox.isChecked()
-        }
-        
-        # Save favorites
-        if hasattr(self, 'coord_selector'):
-            data['crs_favorites'] = self.coord_selector.get_favorites_list()
-            
-        with open(self.settings_file, 'w') as f:
-            json.dump(data, f)
+        self.save_settings()
         event.accept()
 
 if __name__ == '__main__':

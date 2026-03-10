@@ -177,6 +177,10 @@ class DataProcessor:
         # 5. 移除重复 (全量)
         self.links_df = self._remove_duplicate_links(self.links_df, log_callback)
 
+        # 重新计算 Node 的出入度 (因为路段补全和去重改变了拓扑结构)
+        log_callback("更新节点拓扑属性...")
+        self._update_node_topology(log_callback)
+
         # 重新计算区块统计信息 (在补全和去重之后)
         log_callback("更新区块统计信息...")
         self._update_block_stats(log_callback)
@@ -321,6 +325,9 @@ class DataProcessor:
         nodes_df_export = pd.DataFrame(export_nodes_gdf.drop(columns='geometry'))
         nodes_df_export['geometry'] = export_nodes_gdf['geometry'].apply(lambda x: x.wkt)
         nodes_df_export.to_excel(node_excel_path, index=False)
+        
+        # 导出 Node SHP (之前遗漏的部分)
+        log_callback(f"正在生成: {os.path.basename(node_shp_path)}")
         export_nodes_gdf.to_file(node_shp_path, encoding=encoding)
         
         log_callback(f"文件已保存至: {output_dir}")
@@ -506,7 +513,6 @@ class DataProcessor:
             if link_map is not None:
                 valid_cols = link_map[link_map['中文表头'].notnull()]['中文表头'].unique().tolist()
                 self.links_df = self.links_df[[c for c in valid_cols if c in self.links_df.columns]]
-                print(link_map['中文表头'].notnull())
         except Exception as e:
             log_callback(f"警告: 更新属性时出错: {e}")
             import traceback
@@ -548,8 +554,16 @@ class DataProcessor:
             return
 
         # 确保geometry列存在
-        if 'geometry' not in self.nodes_df.columns and 'x_coord' in self.nodes_df.columns:
-            self.nodes_df['geometry'] = self.nodes_df.apply(lambda r: f"POINT({r['x_coord']} {r['y_coord']})", axis=1)
+        # 使用 _get_column_name 查找 '经度' 和 '纬度' 对应的 OSM 表头
+        x_col = self._get_column_name('经度', 'node', 'osm')
+        y_col = self._get_column_name('纬度', 'node', 'osm')
+        
+        # 如果找不到映射，尝试使用默认值 (x_coord, y_coord 是 osm2gmns 的默认输出)
+        if not x_col: x_col = 'x_coord'
+        if not y_col: y_col = 'y_coord'
+
+        if 'geometry' not in self.nodes_df.columns and x_col in self.nodes_df.columns and y_col in self.nodes_df.columns:
+            self.nodes_df['geometry'] = self.nodes_df.apply(lambda r: f"POINT({r[x_col]} {r[y_col]})", axis=1)
 
         # 1. 筛选与重命名
         # 筛选 OSM表头 不为空的行
@@ -617,6 +631,27 @@ class DataProcessor:
             stats_df['节点占比'] = "0.00%"
 
         self.block_stats_df = stats_df[['区块ID', '路段数', '路段占比', '节点数', '节点占比']]
+
+    def _update_node_topology(self, log_callback=print):
+        """
+        更新 Node 的入度、出度和断头路状态 (在路段补全/去重后调用)。
+        """
+        from_col = self._get_column_name('起点', 'link', 'chn')
+        to_col = self._get_column_name('终点', 'link', 'chn')
+        node_id_col = self._get_column_name('编号', 'node', 'chn')
+        
+        if not (from_col in self.links_df.columns and to_col in self.links_df.columns):
+            return
+
+        # 重新构建图计算出入度
+        G_di = nx.from_pandas_edgelist(self.links_df, from_col, to_col, create_using=nx.DiGraph())
+        in_degree = dict(G_di.in_degree())
+        out_degree = dict(G_di.out_degree())
+        
+        # 更新 Nodes DataFrame
+        self.nodes_df['入度'] = self.nodes_df[node_id_col].map(in_degree).fillna(0).astype(int)
+        self.nodes_df['出度'] = self.nodes_df[node_id_col].map(out_degree).fillna(0).astype(int)
+        self.nodes_df['是否断头路'] = ((self.nodes_df['入度'] == 0) | (self.nodes_df['出度'] == 0)).astype(int)
 
     def _update_block_stats(self, log_callback=print):
         """

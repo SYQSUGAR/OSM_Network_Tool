@@ -722,23 +722,72 @@ class DataProcessor:
         to_col = self._get_column_name('终点', 'link', 'chn')
         return links_df.drop_duplicates(subset=[from_col, to_col], keep='first')
 
-    def _reverse_geometry_string(self, geometry_str):
-        if not isinstance(geometry_str, str) or not geometry_str.upper().startswith('LINESTRING'):
-            return geometry_str
-        try:
-            coords_str = re.search(r'\((.*)\)', geometry_str).group(1)
-            coords = [c.strip().split() for c in coords_str.split(',')]
-            reversed_coords = reversed(coords)
-            reversed_coords_str = ", ".join([f"{c[0]} {c[1]}" for c in reversed_coords])
-            return f"LINESTRING ({reversed_coords_str})"
-        except Exception:
-            return geometry_str # 如果解析失败，返回原字符串
+    def _reverse_geometry_string(self, geom):
+        """
+        核心修复：现在的 geom 已经是真正的 Shapely 几何对象了，不再是字符串。
+        我们直接反转其内部的坐标点。
+        """
+        # 如果是真正的 Shapely LineString 对象，直接反转坐标
+        if isinstance(geom, LineString):
+            return LineString(list(geom.coords)[::-1])
+            
+        # 兜底逻辑：如果因为某种原因传入的还是字符串
+        if isinstance(geom, str) and geom.upper().startswith('LINESTRING'):
+            try:
+                coords_str = re.search(r'\((.*)\)', geom).group(1)
+                coords = [c.strip().split() for c in coords_str.split(',')]
+                reversed_coords_str = ", ".join([f"{c[0]} {c[1]}" for c in coords[::-1]])
+                return f"LINESTRING ({reversed_coords_str})"
+            except Exception:
+                return geom
+                
+        return geom
 
 # ==============================================================================
 # 文件导出辅助函数 (Export Helper Functions)
 # ==============================================================================
 
-def export_results(links_df, nodes_df, output_dir, is_raw=False, encoding='gbk', log_callback=print):
+# ==============================================================================
+# 文件导出辅助函数 (Export Helper Functions)
+# ==============================================================================
+
+# ==============================================================================
+# 文件导出辅助函数 (Export Helper Functions)
+# ==============================================================================
+
+def _apply_crs(gdf, target_crs, log_callback):
+    """辅助函数：处理坐标系投影"""
+    if not target_crs:
+        return gdf
+    try:
+        if gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
+            
+        final_crs = None
+        if str(target_crs).lower() == 'auto':
+            # 自动计算 UTM
+            temp_gdf = gdf.to_crs("EPSG:4326") if gdf.crs != "EPSG:4326" else gdf
+            centroid = temp_gdf.unary_union.centroid
+            lat, lon = centroid.y, centroid.x
+            _, _, zone_number, zone_letter = utm.from_latlon(lat, lon)
+            is_northern = zone_letter >= 'N'
+            base_epsg = 32600 if is_northern else 32700
+            final_crs = f"EPSG:{base_epsg + zone_number}"
+            log_callback(f"    自动推断 UTM 投影: {final_crs}")
+        elif str(target_crs).isdigit():
+            final_crs = f"EPSG:{target_crs}"
+        else:
+            final_crs = target_crs
+
+        if final_crs:
+            log_callback(f"    执行投影转换 -> {final_crs}")
+            return gdf.to_crs(final_crs)
+            
+    except Exception as e:
+        log_callback(f"    警告: 坐标转换失败 ({e})，将使用原始坐标系导出。")
+    return gdf
+
+def export_results(links_df, nodes_df, output_dir, is_raw=False, encoding='gbk', target_crs=None, log_callback=print):
     """将最终的DataFrame导出为Excel和Shapefile。"""
     log_callback(f"  开始导出文件 (编码: {encoding})...")
     if not os.path.exists(output_dir):
@@ -750,44 +799,54 @@ def export_results(links_df, nodes_df, output_dir, is_raw=False, encoding='gbk',
     link_shp_path = os.path.join(output_dir, f"link_{suffix}.shp")
     node_shp_path = os.path.join(output_dir, f"node_{suffix}.shp")
     
+    # 导出 Excel（剥离 geometry 转换成 WKT 以免 Excel 报错）
     log_callback(f"    正在写入: {os.path.basename(link_excel_path)}")
-    links_df.to_excel(link_excel_path, index=False)
-    log_callback(f"    正在写入: {os.path.basename(node_excel_path)}")
-    nodes_df.to_excel(node_excel_path, index=False)
+    links_export = links_df.copy()
+    if 'geometry' in links_export.columns:
+        links_export['geometry'] = links_export['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
+    links_export.to_excel(link_excel_path, index=False)
     
-    _create_link_shp(links_df.copy(), link_shp_path, encoding, log_callback)
-    _create_node_shp(nodes_df.copy(), node_shp_path, encoding, log_callback)
+    log_callback(f"    正在写入: {os.path.basename(node_excel_path)}")
+    nodes_export = nodes_df.copy()
+    if 'geometry' in nodes_export.columns:
+        nodes_export['geometry'] = nodes_export['geometry'].apply(lambda x: x.wkt if hasattr(x, 'wkt') else str(x))
+    nodes_export.to_excel(node_excel_path, index=False)
+    
+    # 导出 SHP (使用统一的精简函数)
+    _create_shp(links_df.copy(), link_shp_path, encoding, target_crs, "Link", log_callback)
+    _create_shp(nodes_df.copy(), node_shp_path, encoding, target_crs, "Node", log_callback)
     
     log_callback(f"  文件已保存至: {output_dir}")
     return output_dir
 
-def _create_link_shp(links_df, path, encoding, log_callback=print):
-    """从Link DataFrame创建并保存Shapefile。"""
+def _create_shp(df, path, encoding, target_crs, name, log_callback):
+    """高度复用的 Shapefile 生成器"""
     log_callback(f"    正在生成: {os.path.basename(path)}")
-    if 'geometry' not in links_df.columns or links_df['geometry'].isnull().all():
-        log_callback("    警告: Link DataFrame中无有效的geometry列，跳过SHP生成。")
+    if 'geometry' not in df.columns:
+        log_callback(f"    警告: {name} DataFrame中无 geometry 列，跳过SHP生成。")
         return
+        
     try:
-        # 如果 geometry 列已经是对象，直接用，否则 loads
-        if links_df['geometry'].dtype == object and isinstance(links_df['geometry'].iloc[0], str):
-             links_df['geometry'] = links_df['geometry'].apply(wkt.loads)
-             
-        gdf = gpd.GeoDataFrame(links_df, geometry='geometry')
+        # 万一有残留的字符串，保底转换，然后踢掉空值
+        def safe_wkt_load(x):
+            if isinstance(x, str):
+                try: return wkt.loads(x)
+                except: return None
+            return x
+            
+        df['geometry'] = df['geometry'].apply(safe_wkt_load)
+        valid_df = df.dropna(subset=['geometry']).copy()
+        
+        if valid_df.empty:
+            log_callback(f"    警告: {name} 没有有效的几何数据，跳过SHP生成。")
+            return
+            
+        # 生成 GeoDataFrame 并应用坐标系
+        gdf = gpd.GeoDataFrame(valid_df, geometry='geometry')
+        if gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
+            
+        gdf = _apply_crs(gdf, target_crs, log_callback)
         gdf.to_file(path, encoding=encoding)
     except Exception as e:
-        log_callback(f"    错误: 生成Link SHP失败 - {e}")
-
-def _create_node_shp(nodes_df, path, encoding, log_callback=print):
-    """从Node DataFrame创建并保存Shapefile。"""
-    log_callback(f"    正在生成: {os.path.basename(path)}")
-    if 'geometry' not in nodes_df.columns or nodes_df['geometry'].isnull().all():
-        log_callback("    警告: Node DataFrame中无有效的geometry列，跳过SHP生成。")
-        return
-    try:
-        if nodes_df['geometry'].dtype == object and isinstance(nodes_df['geometry'].iloc[0], str):
-             nodes_df['geometry'] = nodes_df['geometry'].apply(wkt.loads)
-             
-        gdf = gpd.GeoDataFrame(nodes_df, geometry='geometry')
-        gdf.to_file(path, encoding=encoding)
-    except Exception as e:
-        log_callback(f"    错误: 生成Node SHP失败 - {e}")
+        log_callback(f"    错误: 生成 {name} SHP失败 - {e}")

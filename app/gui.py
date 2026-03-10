@@ -110,30 +110,20 @@ class WorkerThread(QThread):
                 self.finished_signal.emit(True, "处理成功")
 
             elif self.task_type == 'export_raw':
-                self.log_signal.emit("步骤 2/2: 正在直接导出原始数据...")
+                self.log_signal.emit("步骤 2/2: 正在直接导出带有坐标系的原始数据...")
+                # 确保把 kwargs 里的 target_crs 传给 export_results
                 result = export_results(links_df, nodes_df, self.kwargs.get('output_dir'), is_raw=True, 
                                         encoding=self.kwargs.get('encoding', 'gbk'),
+                                        target_crs=self.kwargs.get('target_crs'), 
                                         log_callback=self.log_signal.emit)
                 self.log_signal.emit(f"--- 原始数据导出成功！---")
                 self.finished_signal.emit(True, result)
 
             elif self.task_type == 'preview_raw':
                 self.log_signal.emit("步骤 2/2: 正在生成原始数据预览...")
-                # 简单转换为 GDF 供预览，不进行映射和连通性分析
-                # 为了兼容 processor.preview_links_gdf 的结构，我们需要做最小化的转换
-                
-                # 尝试转换 geometry
-                if 'geometry' in links_df.columns:
-                    links_df['geometry'] = links_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
-                processor.preview_links_gdf = gpd.GeoDataFrame(links_df, geometry='geometry')
-                if processor.preview_links_gdf.crs is None:
-                    processor.preview_links_gdf.set_crs(epsg=4326, inplace=True)
-
-                if 'geometry' in nodes_df.columns:
-                    nodes_df['geometry'] = nodes_df['geometry'].apply(lambda x: wkt.loads(x) if isinstance(x, str) else x)
-                processor.preview_nodes_gdf = gpd.GeoDataFrame(nodes_df, geometry='geometry')
-                if processor.preview_nodes_gdf.crs is None:
-                    processor.preview_nodes_gdf.set_crs(epsg=4326, inplace=True)
+                # 核心精简：因为 downloader 出来的已经是合法的 GeoDataFrame 了，直接赋值即可！
+                processor.preview_links_gdf = links_df
+                processor.preview_nodes_gdf = nodes_df
                 
                 self.log_signal.emit(f"--- 原始数据预览准备就绪！---")
                 self.finished_signal.emit(True, "preview_ready")

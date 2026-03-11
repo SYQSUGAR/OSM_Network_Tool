@@ -11,6 +11,7 @@ try:
     import osmnx as ox
 except ImportError:
     pass
+import psutil # 如果没有这个库可以在顶层忽略或加在 requirements.txt 里
 
 def _is_ascii(s):
     """检查字符串是否仅包含纯英文字符 (ASCII)"""

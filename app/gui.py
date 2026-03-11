@@ -19,8 +19,9 @@ try:
 except ImportError:
     WEB_ENGINE_AVAILABLE = False
     print("Warning: PyQt6-WebEngine not found. Map visualization will be disabled.")
+import folium
 
-from .downloader import process_from_osm_file, read_from_csv_files, download_osm_xml
+from .downloader import process_from_osm_file, read_from_csv_files, download_osm_xml, search_city_boundaries, download_osm_by_area_id
 from .processor import DataProcessor, export_results
 
 class PandasModel(QAbstractTableModel):
@@ -120,6 +121,44 @@ class WorkerThread(QThread):
             if self.task_type == 'preprocess':
                 self.log_signal.emit("步骤 2/2: 正在执行数据预处理与全量计算...")
                 # Note: processor already has mappings loaded via update_mappings
+                processor.run_full_processing(
+                    links_df, nodes_df,
+                    log_callback=self.log_signal.emit
+                )
+                self.log_signal.emit(f"--- 处理成功完成！---")
+                self.finished_signal.emit(True, "处理成功")
+
+            elif self.task_type == 'search_city':
+                self.log_signal.emit(f"正在搜索城市: {self.kwargs.get('input_val')}...")
+                gdf = search_city_boundaries(self.kwargs.get('input_val'), log_callback=self.log_signal.emit)
+                if gdf is not None and not gdf.empty:
+                    self.log_signal.emit(f"搜索完成，找到 {len(gdf)} 个结果。")
+                    self.finished_signal.emit(True, gdf)
+                else:
+                    self.log_signal.emit("未找到相关城市。")
+                    self.finished_signal.emit(False, "No results found")
+
+            elif self.task_type == 'download_and_process':
+                self.log_signal.emit("步骤 1/3: 正在下载选中区域数据...")
+                area_id = self.kwargs.get('area_id')
+                output_dir = self.kwargs.get('output_dir')
+                city_name = self.kwargs.get('city_name')
+                
+                # 构造文件名
+                import re
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", city_name).strip()
+                if not safe_name: safe_name = "downloaded_data"
+                osm_path = os.path.join(output_dir, f"{safe_name}.osm")
+                
+                if not os.path.exists(output_dir):
+                    os.makedirs(output_dir)
+                
+                download_osm_by_area_id(area_id, osm_path, log_callback=self.log_signal.emit)
+                
+                self.log_signal.emit("步骤 2/3: 正在解析 OSM 文件...")
+                nodes_df, links_df = process_from_osm_file(osm_path, output_dir, log_callback=self.log_signal.emit)
+                
+                self.log_signal.emit("步骤 3/3: 正在执行数据预处理与全量计算...")
                 processor.run_full_processing(
                     links_df, nodes_df,
                     log_callback=self.log_signal.emit
@@ -575,6 +614,9 @@ class MainWindow(QMainWindow):
         self.city_input = QLineEdit()
         self.city_input.setPlaceholderText("Beijing, China")
         l1.addWidget(self.city_input)
+        self.btn_search_city = QPushButton("查询")
+        self.btn_search_city.clicked.connect(self.start_city_search)
+        l1.addWidget(self.btn_search_city)
         self.input_stack.addWidget(p1)
 
         # Page 2: OSM
@@ -751,62 +793,21 @@ class MainWindow(QMainWindow):
         self.viz_group = QGroupBox("3. 可视化展示")
         right_layout = QVBoxLayout(self.viz_group)
         
-        # Controls
-        viz_ctrl = QHBoxLayout()
-        self.cb_show_links = QCheckBox("Link"); self.cb_show_links.setChecked(True)
-        self.cb_show_nodes = QCheckBox("Node"); self.cb_show_nodes.setChecked(True)
-        viz_ctrl.addWidget(self.cb_show_links)
-        viz_ctrl.addWidget(self.cb_show_nodes)
+        # New Tabbed Interface
+        self.viz_tabs = QTabWidget()
+        right_layout.addWidget(self.viz_tabs)
         
-        viz_ctrl.addWidget(QLabel("Link颜色:"))
-        self.combo_link_attr = QComboBox()
-        viz_ctrl.addWidget(self.combo_link_attr)
-        self.btn_link_color = QPushButton("")
-        self.btn_link_color.setFixedSize(20, 20)
-        self.btn_link_color.setStyleSheet(f"background-color: {self.viz_link_color}; border: none;")
-        self.btn_link_color.clicked.connect(lambda: self.pick_color('link'))
-        viz_ctrl.addWidget(self.btn_link_color)
-
-        viz_ctrl.addWidget(QLabel("Node颜色:"))
-        self.combo_node_attr = QComboBox()
-        viz_ctrl.addWidget(self.combo_node_attr)
-        self.btn_node_color = QPushButton("")
-        self.btn_node_color.setFixedSize(20, 20)
-        self.btn_node_color.setStyleSheet(f"background-color: {self.viz_node_color}; border: none;")
-        self.btn_node_color.clicked.connect(lambda: self.pick_color('node'))
-        viz_ctrl.addWidget(self.btn_node_color)
+        # Tab 1: Download Preview
+        self.download_viz_widget = QWidget()
+        self.init_download_viz_interface()
+        self.viz_tabs.addTab(self.download_viz_widget, "下载预览")
         
-        viz_ctrl.addStretch()
+        # Tab 2: Filter Preview (Original Viz Logic)
+        self.filter_viz_widget = QWidget()
+        self.init_filter_viz_interface()
+        self.viz_tabs.addTab(self.filter_viz_widget, "筛选预览")
         
-        self.preview_btn = QPushButton("生成预览")
-        self.preview_btn.clicked.connect(self.start_preview_generation)
-        viz_ctrl.addWidget(self.preview_btn)
-
-        self.btn_update_map = QPushButton("更新地图")
-        self.btn_update_map.clicked.connect(self.update_viz_map)
-        viz_ctrl.addWidget(self.btn_update_map)
-        
-        # Show/Hide Attr Table Button (Main Viz Control)
-        self.btn_show_attr = QPushButton("属性表")
-        self.btn_show_attr.setCheckable(True)
-        self.btn_show_attr.clicked.connect(self.toggle_attr_table_visibility)
-        viz_ctrl.addWidget(self.btn_show_attr)
-        
-        right_layout.addLayout(viz_ctrl)
-        
-        # Map
-        self.viz_splitter = QSplitter(Qt.Orientation.Vertical)
-        
-        if WEB_ENGINE_AVAILABLE:
-            self.web_view = QWebEngineView()
-            self.web_view.setHtml("<html><body><h3 align='center'>请先生成预览数据</h3></body></html>")
-            self.viz_splitter.addWidget(self.web_view)
-        else:
-            lbl = QLabel("WebEngine not available")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.viz_splitter.addWidget(lbl)
-            
-        # Attribute Table Widget (Collapsible)
+        # Attribute Table Widget (Collapsible) - Shared at bottom
         self.attr_widget = QWidget()
         attr_layout = QVBoxLayout(self.attr_widget)
         attr_layout.setContentsMargins(0, 0, 0, 0)
@@ -859,23 +860,367 @@ class MainWindow(QMainWindow):
         bottom_layout.setContentsMargins(0,0,0,0)
         bottom_layout.addWidget(self.attr_widget)
         
-        self.viz_splitter.addWidget(self.bottom_viz_container)
-        self.viz_splitter.setCollapsible(0, False) # Map always visible unless covered
-        self.viz_splitter.setCollapsible(1, True)
+        # Main Splitter for Right Side (Tabs vs Attr Table)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.addWidget(self.viz_tabs)
+        self.right_splitter.addWidget(self.bottom_viz_container)
+        self.right_splitter.setCollapsible(0, False)
+        self.right_splitter.setCollapsible(1, True)
         
-        self.bottom_viz_container.hide() # Initial state: Hidden
+        # Initial Attr Table State: Hidden
+        self.bottom_viz_container.hide()
         
-        right_layout.addWidget(self.viz_splitter)
+        # Replace original viz_group layout
+        # Wait, viz_group layout is VBox. I should add right_splitter to it.
+        # But wait, viz_tabs is inside viz_group?
+        # The original code added viz_splitter to right_layout.
+        # Now right_layout has viz_tabs? No.
+        
+        # Let's reconstruct right_layout properly.
+        # Clear existing right_layout if any (not needed, we are replacing the block)
+        
+        # Actually, the block I'm replacing ends with `right_layout.addWidget(self.viz_splitter)`.
+        # I need to be careful.
+        
+        # Let's rethink structure:
+        # viz_group
+        #   -> right_layout
+        #      -> right_splitter
+        #         -> Top: viz_tabs (Download / Filter)
+        #         -> Bottom: bottom_viz_container (Attr Table)
+        
+        # So I shouldn't add viz_tabs directly to right_layout.
+        # I should add right_splitter to right_layout.
+        
+        # Corrected Logic below:
+        
+        # ... (Attr Widget setup same as before) ...
+        
+        # Main Splitter
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter.addWidget(self.viz_tabs)
+        self.right_splitter.addWidget(self.bottom_viz_container)
+        self.right_splitter.setCollapsible(0, False)
+        self.right_splitter.setCollapsible(1, True)
+        self.bottom_viz_container.hide()
+        
+        right_layout.addWidget(self.right_splitter)
             
         self.main_splitter.addWidget(self.viz_group)
         
-        # Set initial sizes (Left bigger than before, e.g., 40% : 60% or 45% : 55%)
-        # Previous was 1:2 (33% : 66%). Let's try 450 : 750 (approx 3:5)
+        # Set initial sizes
         self.main_splitter.setSizes([450, 750])
         
         layout.addWidget(self.main_splitter)
 
         self.tabs.addTab(main_tab, "数据处理")
+
+    def init_download_viz_interface(self):
+        layout = QVBoxLayout(self.download_viz_widget)
+        
+        # 1. Search Results Table
+        self.search_result_table = QTableView()
+        self.search_result_model = QStandardItemModel()
+        self.search_result_model.setHorizontalHeaderLabels(["名称", "类型", "OSM ID", "Score"])
+        self.search_result_table.setModel(self.search_result_model)
+        self.search_result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.search_result_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.search_result_table.selectionModel().selectionChanged.connect(self.on_search_result_selected)
+        self.search_result_table.setMaximumHeight(150)
+        
+        layout.addWidget(QLabel("搜索结果 (请选择一项):"))
+        layout.addWidget(self.search_result_table)
+        
+        # 2. Map Preview
+        if WEB_ENGINE_AVAILABLE:
+            self.download_map_view = QWebEngineView()
+            self.download_map_view.setHtml("<html><body><h4 align='center'>请搜索并选择城市以预览范围</h4></body></html>")
+            layout.addWidget(self.download_map_view)
+        else:
+            layout.addWidget(QLabel("Map not available"))
+            self.download_map_view = None
+            
+        # 3. Download Button
+        self.btn_confirm_download = QPushButton("下载选中区域并处理")
+        self.btn_confirm_download.setObjectName("PrimaryBtn")
+        self.btn_confirm_download.setEnabled(False)
+        self.btn_confirm_download.clicked.connect(self.start_download_process)
+        layout.addWidget(self.btn_confirm_download)
+
+    def init_filter_viz_interface(self):
+        layout = QVBoxLayout(self.filter_viz_widget)
+        
+        # Controls
+        viz_ctrl = QHBoxLayout()
+        self.cb_show_links = QCheckBox("Link"); self.cb_show_links.setChecked(True)
+        self.cb_show_nodes = QCheckBox("Node"); self.cb_show_nodes.setChecked(True)
+        viz_ctrl.addWidget(self.cb_show_links)
+        viz_ctrl.addWidget(self.cb_show_nodes)
+        
+        viz_ctrl.addWidget(QLabel("Link颜色:"))
+        self.combo_link_attr = QComboBox()
+        viz_ctrl.addWidget(self.combo_link_attr)
+        self.btn_link_color = QPushButton("")
+        self.btn_link_color.setFixedSize(20, 20)
+        self.btn_link_color.setStyleSheet(f"background-color: {self.viz_link_color}; border: none;")
+        self.btn_link_color.clicked.connect(lambda: self.pick_color('link'))
+        viz_ctrl.addWidget(self.btn_link_color)
+
+        viz_ctrl.addWidget(QLabel("Node颜色:"))
+        self.combo_node_attr = QComboBox()
+        viz_ctrl.addWidget(self.combo_node_attr)
+        self.btn_node_color = QPushButton("")
+        self.btn_node_color.setFixedSize(20, 20)
+        self.btn_node_color.setStyleSheet(f"background-color: {self.viz_node_color}; border: none;")
+        self.btn_node_color.clicked.connect(lambda: self.pick_color('node'))
+        viz_ctrl.addWidget(self.btn_node_color)
+        
+        viz_ctrl.addStretch()
+        
+        self.preview_btn = QPushButton("生成预览")
+        self.preview_btn.clicked.connect(self.start_preview_generation)
+        viz_ctrl.addWidget(self.preview_btn)
+
+        self.btn_update_map = QPushButton("更新地图")
+        self.btn_update_map.clicked.connect(self.update_viz_map)
+        viz_ctrl.addWidget(self.btn_update_map)
+        
+        # Show/Hide Attr Table Button
+        self.btn_show_attr = QPushButton("属性表")
+        self.btn_show_attr.setCheckable(True)
+        self.btn_show_attr.clicked.connect(self.toggle_attr_table_visibility)
+        viz_ctrl.addWidget(self.btn_show_attr)
+        
+        layout.addLayout(viz_ctrl)
+        
+        # Map
+        if WEB_ENGINE_AVAILABLE:
+            self.filter_map_view = QWebEngineView()
+            self.filter_map_view.setHtml("<html><body><h3 align='center'>请先生成预览数据</h3></body></html>")
+            layout.addWidget(self.filter_map_view)
+        else:
+            layout.addWidget(QLabel("Map not available"))
+            self.filter_map_view = None
+
+    def start_city_search(self):
+        city_name = self.city_input.text().strip()
+        if not city_name:
+            QMessageBox.warning(self, "提示", "请输入城市名称")
+            return
+            
+        # Switch to Download Preview tab
+        self.viz_tabs.setCurrentIndex(0)
+        
+        self.log_area.clear()
+        self.log_area.append(f"正在搜索: {city_name}...")
+        
+        self.set_ui_busy(True, 'search_city')
+        self.worker = WorkerThread('search_city', input_val=city_name)
+        self.worker.log_signal.connect(self.log)
+        self.worker.finished_signal.connect(self.on_search_finished)
+        self.worker.start()
+        
+    def on_search_finished(self, success, result):
+        self.set_ui_busy(False)
+        self.worker = None
+        
+        if success:
+            self.search_results_gdf = result
+            # Populate Table
+            self.search_result_model.removeRows(0, self.search_result_model.rowCount())
+            
+            for i, row in result.iterrows():
+                name = row.get('display_name', 'Unknown')
+                otype = row.get('osm_type', 'Unknown')
+                oid = str(row.get('osmid', '')) if 'osmid' in row else str(row.name)
+                score = str(row.get('importance', '')) if 'importance' in row else ''
+                
+                items = [
+                    QStandardItem(str(name)),
+                    QStandardItem(str(otype)),
+                    QStandardItem(oid),
+                    QStandardItem(score)
+                ]
+                for item in items: item.setEditable(False)
+                self.search_result_model.appendRow(items)
+                
+            # Select first row by default
+            if self.search_result_model.rowCount() > 0:
+                self.search_result_table.selectRow(0)
+        else:
+            QMessageBox.warning(self, "提示", "未找到相关城市信息。")
+
+    def on_search_result_selected(self, selected, deselected):
+        indexes = self.search_result_table.selectionModel().selectedRows()
+        if not indexes:
+            self.btn_confirm_download.setEnabled(False)
+            return
+            
+        row_idx = indexes[0].row()
+        self.btn_confirm_download.setEnabled(True)
+        
+        # Update Map Preview
+        if hasattr(self, 'search_results_gdf') and self.download_map_view:
+            try:
+                # Get geometry
+                selected_row = self.search_results_gdf.iloc[row_idx]
+                geom = selected_row.geometry
+                
+                # Create map
+                import folium
+                centroid = geom.centroid
+                m = folium.Map(location=[centroid.y, centroid.x], zoom_start=10, tiles='CartoDB positron')
+                
+                # Draw boundary
+                folium.GeoJson(
+                    geom,
+                    style_function=lambda x: {'color': '#3388ff', 'weight': 3, 'fillOpacity': 0.1}
+                ).add_to(m)
+                
+                # Fit bounds
+                bounds = geom.bounds # minx, miny, maxx, maxy
+                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                
+                self.download_map_view.setHtml(m._repr_html_())
+            except Exception as e:
+                self.log(f"预览地图更新失败: {e}")
+
+    def start_download_process(self):
+        indexes = self.search_result_table.selectionModel().selectedRows()
+        if not indexes: return
+        
+        row_idx = indexes[0].row()
+        row = self.search_results_gdf.iloc[row_idx]
+        
+        # Calculate Area ID
+        osm_id = row['osmid'] if 'osmid' in row else row.name
+        osm_type = row['osm_type'] if 'osm_type' in row else 'relation'
+        
+        area_id = int(osm_id)
+        if osm_type == 'relation':
+            area_id += 3600000000
+        elif osm_type == 'way':
+            area_id += 2400000000
+            
+        output_dir = self.out_input.text().strip()
+        city_name = self.city_input.text().strip()
+        
+        # Start Worker
+        self.set_ui_busy(True, 'download_and_process')
+        self.worker = WorkerThread('download_and_process', 
+                                   area_id=area_id, 
+                                   output_dir=output_dir,
+                                   city_name=city_name,
+                                   processor=self.processor)
+        self.worker.log_signal.connect(self.log)
+        self.worker.finished_signal.connect(self.on_task_finished)
+        self.worker.start()
+        
+    # Override maximize_attr_table to handle new splitter
+    def maximize_attr_table(self):
+        """Toggle maximize/restore for attribute table."""
+        is_max = self.btn_maximize_attr.isChecked()
+        if is_max:
+            self.btn_maximize_attr.setText("还原")
+            # Hide map (index 0)
+            self.right_splitter.setSizes([0, 1000])
+        else:
+            self.btn_maximize_attr.setText("最大化")
+            # Restore map (approx 60/40)
+            total = self.right_splitter.height()
+            self.right_splitter.setSizes([int(total*0.6), int(total*0.4)])
+            
+    # Update toggle_attr_table_visibility to use right_splitter
+    def toggle_attr_table_visibility(self):
+        """Show/Hide the bottom attribute table area."""
+        visible = self.btn_show_attr.isChecked()
+        if visible:
+            self.bottom_viz_container.show() # Show container
+            
+            # Restore previous sizes if available
+            current_height = self.right_splitter.height()
+            if self.last_viz_splitter_sizes and sum(self.last_viz_splitter_sizes) > 0:
+                 # Adjust proportionally to current height
+                 ratio = current_height / sum(self.last_viz_splitter_sizes)
+                 new_sizes = [int(s * ratio) for s in self.last_viz_splitter_sizes]
+                 if new_sizes[1] < 50:
+                     new_sizes = [int(current_height*0.6), int(current_height*0.4)]
+                 self.right_splitter.setSizes(new_sizes)
+            else:
+                 self.right_splitter.setSizes([int(current_height*0.6), int(current_height*0.4)])
+            
+            if self.link_attr_model.rowCount() == 0:
+                self.start_update_attribute_tables_thread()
+        else:
+            # Save current sizes before hiding
+            sizes = self.right_splitter.sizes()
+            if sizes[1] > 0:
+                self.last_viz_splitter_sizes = sizes
+            
+            self.bottom_viz_container.hide()
+            self.right_splitter.setSizes([1000, 0])
+            
+    # Update update_viz_map to use filter_map_view
+    def update_viz_map(self):
+        if not WEB_ENGINE_AVAILABLE: return
+        if not self.filter_map_view: return
+        
+        links = self.processor.preview_links_gdf
+        nodes = self.processor.preview_nodes_gdf
+        
+        if links is None and nodes is None:
+            return
+            
+        try:
+            # Create Map
+            m = folium.Map(location=[39.9, 116.4], zoom_start=12, tiles='CartoDB positron')
+            
+            # Auto-center
+            bounds = None
+            if links is not None and not links.empty:
+                bounds = links.total_bounds
+            elif nodes is not None and not nodes.empty:
+                bounds = nodes.total_bounds
+                
+            if bounds is not None:
+                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+
+            # Draw Links
+            if self.cb_show_links.isChecked() and links is not None:
+                attr = self.combo_link_attr.currentText()
+                # Simple style function
+                def style_fn(feature):
+                    return {
+                        'color': self.viz_link_color,
+                        'weight': 2,
+                        'opacity': 0.7
+                    }
+                folium.GeoJson(
+                    links,
+                    name="Links",
+                    style_function=style_fn,
+                    tooltip=folium.GeoJsonTooltip(fields=[attr] if attr else None)
+                ).add_to(m)
+
+            # Draw Nodes
+            if self.cb_show_nodes.isChecked() and nodes is not None:
+                for _, row in nodes.iterrows():
+                    folium.CircleMarker(
+                        location=[row.geometry.y, row.geometry.x],
+                        radius=3,
+                        color=self.viz_node_color,
+                        fill=True,
+                        popup=str(row.to_dict())
+                    ).add_to(m)
+
+            # Save to temp
+            data = m._repr_html_()
+            self.filter_map_view.setHtml(data)
+            
+        except Exception as e:
+            self.log(f"Map Error: {e}")
+
+
 
     # =============================================================================================
     #  Tab 2: Settings (Mappings)
@@ -1460,27 +1805,42 @@ class MainWindow(QMainWindow):
     def set_ui_busy(self, busy, task_type=None):
         """
         根据任务类型设置UI繁忙状态
+        busy: True/False
+        task_type: 'preprocess' (Acquisition) 或 'filter_and_export' (Export) 等
         """
-        is_preprocess_task = task_type in ['preprocess', 'preview_raw']
+        # 修改任务类型判断逻辑
+        # 'export_raw_with_stop' 是为了区分原始导出操作，它应该被视为导出任务
+        is_preprocess_task = task_type in ['preprocess', 'preview_raw', 'download_and_process']
+        is_search_task = task_type == 'search_city'
+        # 注意: 'export_raw' 之前被归类为 preprocess，现在如果它被明确为导出任务，应该移到下面
+        # 但 'export_raw' 在没有格式转换时是直接导出，逻辑上它是一个“导出”操作
+        
         is_export_task = task_type in ['filter_and_export', 'export_preview_current', 'export_raw_with_stop', 'export_raw']
 
         if busy:
-            # ====== 核心修复 2：任务运行时，锁定格式转换复选框，禁止用户在运行中途更改 ======
-            self.format_conversion_checkbox.setEnabled(False)
-            
             # 1. 在任务运行期间，禁用所有“开始”类按钮
             self.run_btn.setEnabled(False)
             self.export_filtered_btn.setEnabled(False)
             self.preview_btn.setEnabled(False)
+            self.btn_search_city.setEnabled(False)
+            self.btn_confirm_download.setEnabled(False)
             
             # 2. 根据任务类型，仅启用对应的“停止”按钮
             if is_preprocess_task:
+                # 正在进行数据处理/获取
                 self.btn_stop_preprocess.setEnabled(True)
                 self.btn_stop_export.setEnabled(False)
             elif is_export_task:
+                # 正在进行导出操作
                 self.btn_stop_preprocess.setEnabled(False)
                 self.btn_stop_export.setEnabled(True)
+            elif is_search_task:
+                # 搜索任务通常很快，不需要停止按钮，但为了一致性可以禁用其他
+                self.btn_stop_preprocess.setEnabled(False)
+                self.btn_stop_export.setEnabled(False)
             else:
+                # 其他可能的异步任务 (如生成预览、预览导出等)
+                # 默认逻辑: 如果没有明确分类，为了安全都禁用停止按钮，或根据需要扩展
                 self.btn_stop_preprocess.setEnabled(False)
                 self.btn_stop_export.setEnabled(False)
             
@@ -1489,13 +1849,14 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 0)
             
         else:
-            # ====== 核心修复 3：任务结束后，解锁格式转换复选框 ======
-            self.format_conversion_checkbox.setEnabled(True)
-            
             # 3. 任务结束（正常或停止）后，恢复所有“开始”按钮
             self.run_btn.setEnabled(self.format_conversion_checkbox.isChecked())
             self.export_filtered_btn.setEnabled(True)
             self.preview_btn.setEnabled(True)
+            self.btn_search_city.setEnabled(True)
+            # 只有当有选中行时才恢复下载按钮
+            if hasattr(self, 'search_result_table') and self.search_result_table.selectionModel().hasSelection():
+                self.btn_confirm_download.setEnabled(True)
             
             # 4. 任务结束后，禁用所有“停止”按钮
             self.btn_stop_preprocess.setEnabled(False)

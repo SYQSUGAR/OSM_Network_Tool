@@ -64,74 +64,60 @@ def _standardize_geometry(nodes_df, links_df, log_callback):
 
     return nodes_gdf, links_gdf
 
-def download_osm_xml(city_name, output_path, log_callback=print):
+def search_city_boundaries(city_name, log_callback=print):
     """
-    下载 OSM XML 数据到指定路径
+    根据城市名搜索边界信息
+    返回: GeoDataFrame (包含 candidates)
     """
     try:
         import osmnx as ox
     except ImportError:
         raise ImportError("需要安装 osmnx 库才能使用联网下载功能 (pip install osmnx)")
 
-    log_callback(f"正在获取 '{city_name}' 的地理边界信息...")
+    log_callback(f"正在搜索 '{city_name}' 的地理边界信息...")
     try:
-        try:
-            gdf = ox.geocode_to_gdf(city_name)
-        except Exception as geo_e:
-            log_callback(f"❌ 地理编码底层失败: {geo_e}")
-            raise ValueError(f"无法解析该地名，请检查拼写或尝试纯英文 (底层错误: {geo_e})")
-
+        # 使用 osmnx 获取所有匹配项
+        gdf = ox.geocode_to_gdf(city_name)
         if gdf.empty:
-            raise ValueError(f"OSM 服务器返回了空的数据，完全找不到: {city_name}")
+            log_callback(f"未找到城市: {city_name}")
+            return None
+            
+        log_callback(f"找到 {len(gdf)} 个匹配项。")
+        # 确保包含必要的列 (osmnx版本差异处理)
+        if 'display_name' not in gdf.columns:
+            # 有些旧版本可能没有 display_name，尝试用 name + type 组合
+            gdf['display_name'] = gdf['name'] if 'name' in gdf.columns else city_name
+            
+        return gdf
+    except Exception as e:
+        log_callback(f"搜索失败: {e}")
+        raise e
 
-        row = gdf.iloc[0]
-        
-        osm_id = None
-        if 'osm_id' in gdf.columns:        
-            osm_id = row['osm_id']
-        elif 'osmid' in gdf.columns:       
-            osm_id = row['osmid']
-        elif 'id' in gdf.columns:
-            osm_id = row['id']
-        elif gdf.index.name in ['osmid', 'osm_id']:
-            osm_id = row.name
-            
-        if isinstance(osm_id, (list, pd.Series, tuple)):
-            osm_id = osm_id[0]
-            
-        if osm_id is None or pd.isna(osm_id) or int(osm_id) == 0:
-            raw_data = row.drop('geometry', errors='ignore').to_dict()
-            log_callback(f"🛠️ [异常返回明细] {raw_data}")
-            raise ValueError(f"无法获取 '{city_name}' 的有效 OSM ID。")
-            
-        osm_id = int(osm_id)
-        osm_type = row.get('osm_type', 'relation')
-        
-        area_id = osm_id
-        if osm_type == 'relation':
-            area_id += 3600000000
-        elif osm_type == 'way':
-            area_id += 2400000000
-        
-        log_callback(f"获取边界成功 (Area ID: {area_id})，正在请求 Overpass API...")
-        
+def download_osm_by_area_id(area_id, output_path, log_callback=print):
+    """
+    根据确定的 Area ID 下载 OSM 数据
+    """
+    log_callback(f"正在根据 Area ID ({area_id}) 下载数据...")
+    try:
+        # 2. Construct Query
         query = f"""
-        [out:xml][timeout:600];
+        [out:xml][timeout:180];
         area({area_id})->.searchArea;
         (
-          way["highway"]["highway"!~"footway|path|steps|cycleway|pedestrian|track"](area.searchArea);
+          way["highway"](area.searchArea);
         );
         (._;>;);
         out meta;
         """
         
+        # 3. Download
         overpass_url = "https://overpass-api.de/api/interpreter"
-        response = requests.post(overpass_url, data={'data': query}, stream=True, timeout=600)
+        response = requests.post(overpass_url, data={'data': query}, stream=True, timeout=180)
         
         if response.status_code != 200:
             raise RuntimeError(f"Overpass API 请求失败 (代码 {response.status_code}): {response.text[:200]}")
             
-        log_callback(f"正在下载数据至: {output_path} (大城市可能需要 2~5 分钟，请耐心等待...)")
+        log_callback(f"正在下载数据至: {output_path}")
         total_size = 0
         with open(output_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=1024*1024): 
@@ -139,22 +125,31 @@ def download_osm_xml(city_name, output_path, log_callback=print):
                     f.write(chunk)
                     total_size += len(chunk)
                     
-        if total_size < 1024: 
-            import re
-            os.remove(output_path) 
-            error_msg = "未知错误"
-            if hasattr(response, 'text') and "<remark>" in response.text:
-                remark_match = re.search(r'<remark>(.*?)</remark>', response.text, re.DOTALL)
-                if remark_match: error_msg = remark_match.group(1).strip()
-            
-            raise RuntimeError(f"Overpass API 返回了空数据。可能是请求范围过大导致超时，错误详情: {error_msg}\n👉 建议：点击下方的【打开 OSM 官网】进行手动小范围框选下载！")
-            
         log_callback(f"下载完成，文件大小: {total_size / 1024 / 1024:.2f} MB")
         return True
-        
     except Exception as e:
-        log_callback(f"联网下载失败: {e}")
+        log_callback(f"下载失败: {e}")
         raise e
+
+def download_osm_xml(city_name, output_path, log_callback=print):
+    """
+    下载 OSM XML 数据到指定路径 (简易版，直接取第一个匹配项)
+    """
+    gdf = search_city_boundaries(city_name, log_callback)
+    if gdf is None or gdf.empty:
+        raise ValueError(f"无法找到城市: {city_name}")
+    
+    row = gdf.iloc[0]
+    osm_id = row['osmid'] if 'osmid' in row else row.name
+    osm_type = row['osm_type'] if 'osm_type' in row else 'relation'
+    
+    area_id = int(osm_id)
+    if osm_type == 'relation':
+        area_id += 3600000000
+    elif osm_type == 'way':
+        area_id += 2400000000
+        
+    return download_osm_by_area_id(area_id, output_path, log_callback)
 
 def process_from_osm_file(osm_file_path, output_directory, log_callback=print):
     osm_file_path = os.path.normpath(os.path.abspath(osm_file_path))

@@ -20,7 +20,7 @@ except ImportError:
     WEB_ENGINE_AVAILABLE = False
     print("Warning: PyQt6-WebEngine not found. Map visualization will be disabled.")
 
-from .downloader import download_from_osmnx, process_from_osm_file, read_from_csv_files, download_osm_xml
+from .downloader import process_from_osm_file, read_from_csv_files, download_osm_xml
 from .processor import DataProcessor, export_results
 
 class PandasModel(QAbstractTableModel):

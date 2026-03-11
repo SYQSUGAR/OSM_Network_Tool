@@ -1,9 +1,9 @@
 {
     "last_osm_dir": "E:/1工作/科研项目/软件开发/爬取代码",
-    "city": "榆林",
+    "city": "延安市",
     "out_dir": "E:\\1工作\\科研项目\\软件开发\\爬取代码\\output",
     "fmt_conv": true,
-    "osm_file": "E:/1工作/科研项目/软件开发/爬取代码/NanAn.osm",
+    "osm_file": "E:/1工作/科研项目/软件开发/爬取代码/Yulingis.osm",
     "link_file": "E:/1工作/科研项目/软件开发/爬取代码/output/link.csv",
     "node_file": "E:/1工作/科研项目/软件开发/爬取代码/output/node.csv",
     "last_mode_id": 1,

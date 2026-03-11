@@ -20,7 +20,7 @@ except ImportError:
     WEB_ENGINE_AVAILABLE = False
     print("Warning: PyQt6-WebEngine not found. Map visualization will be disabled.")
 
-from .downloader import download_from_osmnx, process_from_osm_file, read_from_csv_files
+from .downloader import download_from_osmnx, process_from_osm_file, read_from_csv_files, download_osm_xml
 from .processor import DataProcessor, export_results
 
 class PandasModel(QAbstractTableModel):
@@ -84,7 +84,25 @@ class WorkerThread(QThread):
                 self.log_signal.emit("步骤 1/2: 正在获取源数据...")
                 
                 if mode == 'online':
-                    nodes_df, links_df = download_from_osmnx(input_val, log_callback=self.log_signal.emit)
+                    # nodes_df, links_df = download_from_osmnx(input_val, log_callback=self.log_signal.emit)
+                    # 修改为：先下载 .osm 文件，再调用 OSM 处理流程
+                    
+                    # 1. 构造文件名
+                    import re
+                    # 简单的文件名清理
+                    safe_name = re.sub(r'[\\/*?:"<>|]', "", input_val).strip()
+                    if not safe_name: safe_name = "downloaded_data"
+                    osm_path = os.path.join(output_dir, f"{safe_name}.osm")
+                    
+                    if not os.path.exists(output_dir):
+                        os.makedirs(output_dir)
+                        
+                    # 2. 下载
+                    download_osm_xml(input_val, osm_path, log_callback=self.log_signal.emit)
+                    
+                    # 3. 解析 (复用 OSM 文件处理逻辑)
+                    nodes_df, links_df = process_from_osm_file(osm_path, output_dir, log_callback=self.log_signal.emit)
+
                 elif mode == 'osm':
                     nodes_df, links_df = process_from_osm_file(input_val, output_dir, log_callback=self.log_signal.emit)
                 elif mode == 'csv':

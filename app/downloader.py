@@ -7,6 +7,7 @@ import uuid
 import pandas as pd
 import geopandas as gpd
 from shapely import wkt
+import requests
 try:
     import osmnx as ox
 except ImportError:
@@ -73,8 +74,78 @@ def _standardize_geometry(nodes_df, links_df, log_callback):
     return nodes_gdf, links_gdf
 # ===============================================================
 
+def download_osm_xml(city_name, output_path, log_callback=print):
+    """
+    下载 OSM XML 数据到指定路径
+    1. 使用 osmnx 获取城市的 Area ID
+    2. 构造 Overpass QL 查询
+    3. 下载并保存为 .osm 文件
+    """
+    try:
+        import osmnx as ox
+    except ImportError:
+        raise ImportError("需要安装 osmnx 库才能使用联网下载功能 (pip install osmnx)")
+
+    log_callback(f"正在获取 '{city_name}' 的地理边界信息...")
+    try:
+        # 1. Geocode
+        gdf = ox.geocode_to_gdf(city_name)
+        if gdf.empty:
+            raise ValueError(f"无法找到城市: {city_name}")
+        
+        row = gdf.iloc[0]
+        # 兼容不同版本的 osmnx (osmid 可能在 index 或 column)
+        osm_id = row['osmid'] if 'osmid' in row else row.name
+        osm_type = row['osm_type'] if 'osm_type' in row else 'relation'
+        
+        # Calculate Overpass Area ID
+        # Relation: +3600000000, Way: +2400000000
+        area_id = int(osm_id)
+        if osm_type == 'relation':
+            area_id += 3600000000
+        elif osm_type == 'way':
+            area_id += 2400000000
+        
+        log_callback(f"获取边界成功 (Area ID: {area_id})，正在请求 Overpass API...")
+        
+        # 2. Construct Query
+        # 获取主要路网 (highway)
+        query = f"""
+        [out:xml][timeout:180];
+        area({area_id})->.searchArea;
+        (
+          way["highway"](area.searchArea);
+        );
+        (._;>;);
+        out meta;
+        """
+        
+        # 3. Download
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        # 使用流式下载防止内存溢出
+        response = requests.post(overpass_url, data={'data': query}, stream=True, timeout=180)
+        
+        if response.status_code != 200:
+            raise RuntimeError(f"Overpass API 请求失败 (代码 {response.status_code}): {response.text[:200]}")
+            
+        log_callback(f"正在下载数据至: {output_path}")
+        total_size = 0
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=1024*1024): # 1MB chunks
+                if chunk:
+                    f.write(chunk)
+                    total_size += len(chunk)
+                    
+        log_callback(f"下载完成，文件大小: {total_size / 1024 / 1024:.2f} MB")
+        return True
+        
+    except Exception as e:
+        log_callback(f"联网下载失败: {e}")
+        raise e
+
 def download_from_osmnx(city_name, log_callback=print):
-    """模式1: 联网下载"""
+    """(已弃用) 模式1: 联网下载"""
+    # 此函数保留作为备用或向后兼容，但 GUI 将改用 download_osm_xml + process_from_osm_file
     log_callback(f"开始从 osmnx 下载 '{city_name}' 的路网数据...")
     G = ox.graph_from_place(city_name, network_type='drive')
     nodes, edges = ox.graph_to_gdfs(G)

@@ -507,6 +507,10 @@ class DataProcessor:
                 # 只有匹配成功的部分才更新等级为数字，否则保留原等级？
                 # Notebook 逻辑是直接赋值。
                 self.links_df[road_level_col] = matched_attrs['道路等级Num'].values
+                
+                # ====== 新增：二次等级替换 ======
+                # 直接一行搞定：包含“高速”的强制设为0，na=False 自动忽略空值防报错
+                self.links_df.loc[self.links_df[name_col].str.contains('高速', na=False), road_level_col] = 0
             
             # 仅保留中文表头不为空的那些属性 (Notebook: RoadTSCsv = RoadTSCsv[roadTitleEO[~roadTitleEO['中文表头'].isnull()]['中文表头']])
             link_map = self.mapping_files.get('link_osm_index')

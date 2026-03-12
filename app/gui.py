@@ -552,11 +552,101 @@ class MainWindow(QMainWindow):
         # 但要注意这些样式也应该根据主题变化
         # 为了简化，我们尽量让 theme.py 处理所有通用样式，这里只处理极少数特例
         
+        # 补充：恢复浅色模式下的按钮颜色
+        self.setStyleSheet("""
+            /* 功能性按钮颜色 */
+            
+            /* 深色模式下的按钮 */
+            QPushButton#PrimaryBtn { 
+                background-color: #0d47a1; 
+                color: white; 
+                border: 1px solid #002171; 
+                font-weight: bold; 
+            }
+            QPushButton#PrimaryBtn:hover { 
+                background-color: #1565c0; 
+                border: 1px solid #002171;
+            }
+            
+            QPushButton#SuccessBtn { 
+                background-color: #1b5e20; 
+                color: white; 
+                border: 1px solid #003300; 
+                font-weight: bold; 
+            }
+            QPushButton#SuccessBtn:hover { 
+                background-color: #2e7d32; 
+                border: 1px solid #003300;
+            }
+
+            QPushButton#StopBtn { 
+                background-color: #b71c1c; 
+                color: white; 
+                border: 1px solid #7f0000; 
+                font-weight: bold; 
+            }
+            QPushButton#StopBtn:hover { 
+                background-color: #c62828; 
+                border: 1px solid #7f0000;
+            }
+        """)
+
         # 初始应用默认主题 (如果 load_settings 还没运行，默认是 dark)
         # load_settings 会覆盖它
         app = QApplication.instance()
         if app:
             apply_theme(app, self.current_theme)
+        self.update_custom_style()
+
+    def update_custom_style(self):
+        """
+        根据当前主题，动态注入特定的QSS
+        主要用于区分深浅模式下那些颜色需要反转的控件
+        """
+        if self.current_theme == 'dark':
+            self.setStyleSheet("""
+                /* 深色模式特定微调 */
+                QPushButton#PrimaryBtn { 
+                    background-color: #0d47a1; color: white; border: 1px solid #002171; font-weight: bold; 
+                }
+                QPushButton#PrimaryBtn:hover { background-color: #1565c0; }
+                
+                QPushButton#SuccessBtn { 
+                    background-color: #1b5e20; color: white; border: 1px solid #003300; font-weight: bold; 
+                }
+                QPushButton#SuccessBtn:hover { background-color: #2e7d32; }
+
+                QPushButton#StopBtn { 
+                    background-color: #b71c1c; color: white; border: 1px solid #7f0000; font-weight: bold; 
+                }
+                QPushButton#StopBtn:hover { background-color: #c62828; }
+                
+                QLabel#TitleLabel { color: #e0e0e0; }
+            """)
+        else:
+            # 浅色模式 - 恢复为原来鲜艳的颜色
+            self.setStyleSheet("""
+                /* 浅色模式特定微调 */
+                QPushButton#PrimaryBtn { 
+                    background-color: #3498db; color: white; border: none; font-weight: bold; 
+                }
+                QPushButton#PrimaryBtn:hover { background-color: #2980b9; }
+                QPushButton#PrimaryBtn:disabled { background-color: #95a5a6; }
+                
+                QPushButton#SuccessBtn { 
+                    background-color: #2ecc71; color: white; border: none; font-weight: bold; 
+                }
+                QPushButton#SuccessBtn:hover { background-color: #27ae60; }
+                QPushButton#SuccessBtn:disabled { background-color: #95a5a6; }
+
+                QPushButton#StopBtn { 
+                    background-color: #e74c3c; color: white; border: none; font-weight: bold; 
+                }
+                QPushButton#StopBtn:hover { background-color: #c0392b; }
+                QPushButton#StopBtn:disabled { background-color: #95a5a6; }
+                
+                QLabel#TitleLabel { color: #2c3e50; }
+            """)
 
     def init_menu_bar(self):
         """初始化菜单栏"""
@@ -590,6 +680,9 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app:
             apply_theme(app, theme_name)
+            
+        # 应用自定义的补充样式（按钮颜色等）
+        self.update_custom_style()
             
         # 更新菜单勾选状态
         self.update_theme_menu_state()

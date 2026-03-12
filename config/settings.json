@@ -6,7 +6,7 @@
     "osm_file": "E:/1工作/科研项目/软件开发/爬取代码/Yulingis.osm",
     "link_file": "E:/1工作/科研项目/软件开发/爬取代码/output/link.csv",
     "node_file": "E:/1工作/科研项目/软件开发/爬取代码/output/node.csv",
-    "last_mode_id": 1,
+    "last_mode_id": 3,
     "crs_favorites": [
         "WGS 84 (EPSG:4326) - 国际标准GPS坐标",
         "CGCS2000 (EPSG:4490) - 2000国家大地坐标系",

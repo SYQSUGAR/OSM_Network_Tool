@@ -7,13 +7,14 @@
     "link_file": "E:/1工作/科研项目/软件开发/爬取代码/output/link.csv",
     "node_file": "E:/1工作/科研项目/软件开发/爬取代码/output/node.csv",
     "last_mode_id": 3,
+    "theme": "light",
     "crs_favorites": [
-        "WGS 84 (EPSG:4326) - 国际标准GPS坐标",
         "CGCS2000 (EPSG:4490) - 2000国家大地坐标系",
         "WGS 84 / Pseudo-Mercator (EPSG:3857) - 网页地图通用",
         "GCJ-02 - 国测局火星坐标系 (高德/腾讯)",
         "BD-09 - 百度坐标系",
-        "WGS 84 / UTM zone 49N (EPSG:32649)"
+        "WGS 84 / UTM zone 49N (EPSG:32649)",
+        "WGS 84 (EPSG:4326) - 国际标准GPS坐标"
     ],
     "last_crs_selection": "  WGS 84 (EPSG:4326) - 国际标准GPS坐标"
 }

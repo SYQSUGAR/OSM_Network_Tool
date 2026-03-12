@@ -27,6 +27,10 @@ def main():
     # =================================================================
 
     app = QApplication(sys.argv)
+    
+    # 主题应用现已移交给 MainWindow 的初始化过程 (app/gui.py)
+    # MainWindow 在加载配置时会根据保存的设置（或默认 dark）来调用 apply_theme
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

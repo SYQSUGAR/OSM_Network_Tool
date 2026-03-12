@@ -7,21 +7,29 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QFileDialog, QProgressBar, QMessageBox, 
                              QGroupBox, QFrame, QRadioButton, QButtonGroup, QTabWidget, QStackedWidget, QCheckBox,
                              QTableView, QHeaderView, QSplitter, QComboBox, QColorDialog, QTableWidget, QTableWidgetItem,
-                             QCompleter)
-from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont
+                             QCompleter, QMenuBar, QMenu)
+from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QAction
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel
 from shapely import wkt
 import geopandas as gpd
 
 try:
+    import folium
+except ImportError:
+    folium = None
+    print("Warning: folium not found. Map visualization will be disabled.")
+
+try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
-    WEB_ENGINE_AVAILABLE = True
+    # Map needs both WebEngine and Folium
+    WEB_ENGINE_AVAILABLE = True if folium else False
 except ImportError:
     WEB_ENGINE_AVAILABLE = False
     print("Warning: PyQt6-WebEngine not found. Map visualization will be disabled.")
 
 from .downloader import process_from_osm_file, read_from_csv_files, download_osm_xml
 from .processor import DataProcessor, export_results
+from .theme import apply_theme # 导入主题应用函数
 
 class PandasModel(QAbstractTableModel):
     """
@@ -272,8 +280,8 @@ class CoordSysSelector(QWidget):
         self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.fav_btn.setFixedWidth(80)
         self.fav_btn.setStyleSheet("""
-            QPushButton { background-color: transparent; border: 1px solid #dcdde1; border-radius: 4px; color: #7f8fa6; font-weight: bold;}
-            QPushButton:hover { background-color: #f5f6fa; }
+            QPushButton { background-color: transparent; border: 1px solid #555555; border-radius: 4px; color: #b0b0b0; font-weight: bold;}
+            QPushButton:hover { background-color: #3d3d3d; }
         """)
 
         layout.addWidget(label)
@@ -319,8 +327,23 @@ class CoordSysSelector(QWidget):
         font = QFont()
         font.setBold(True)
         item.setFont(font)
-        item.setBackground(QColor("#f1f2f6"))
-        item.setForeground(QColor("#2f3640"))
+        
+        # 获取当前主题 (通过 parent 寻找 MainWindow)
+        current_theme = 'dark'
+        p = self.parent()
+        while p:
+            if isinstance(p, QMainWindow) and hasattr(p, 'current_theme'):
+                current_theme = p.current_theme
+                break
+            p = p.parent()
+            
+        if current_theme == 'dark':
+            item.setBackground(QColor("#454545"))
+            item.setForeground(QColor("#ffffff"))
+        else:
+            item.setBackground(QColor("#f1f2f6"))
+            item.setForeground(QColor("#2f3640"))
+            
         self.model.appendRow(item)
 
     def add_item(self, text):
@@ -332,17 +355,42 @@ class CoordSysSelector(QWidget):
     def check_favorite_status(self, text):
         """检查当前输入的坐标系是否在常用列表中，动态改变按钮样式"""
         clean_text = text.strip() # 去除可能带有的缩进空格
+        
+        # 获取当前主题 (通过 parent 寻找 MainWindow)
+        current_theme = 'dark'
+        p = self.parent()
+        while p:
+            if isinstance(p, QMainWindow) and hasattr(p, 'current_theme'):
+                current_theme = p.current_theme
+                break
+            p = p.parent()
+
         if not clean_text:
             self.fav_btn.setText("☆ 收藏")
-            self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px;")
+            if current_theme == 'dark':
+                self.fav_btn.setStyleSheet("color: #b0b0b0; border: 1px solid #555555; border-radius: 4px;")
+            else:
+                self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px;")
             return
 
         if clean_text in self.favorites:
             self.fav_btn.setText("★ 已收藏")
-            self.fav_btn.setStyleSheet("color: #e67e22; border: 1px solid #e67e22; border-radius: 4px; background-color: #fff3e0;")
+            if current_theme == 'dark':
+                self.fav_btn.setStyleSheet("color: #ffa726; border: 1px solid #ffa726; border-radius: 4px; background-color: #3e2723;")
+            else:
+                self.fav_btn.setStyleSheet("color: #e67e22; border: 1px solid #e67e22; border-radius: 4px; background-color: #fff3e0;")
         else:
             self.fav_btn.setText("☆ 收藏")
-            self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px; background-color: transparent;")
+            if current_theme == 'dark':
+                self.fav_btn.setStyleSheet("color: #b0b0b0; border: 1px solid #555555; border-radius: 4px; background-color: transparent;")
+            else:
+                self.fav_btn.setStyleSheet("color: #7f8fa6; border: 1px solid #dcdde1; border-radius: 4px; background-color: transparent;")
+
+    def update_theme_style(self):
+        """当全局主题改变时，刷新自身样式"""
+        # 获取当前文本并触发状态检查即可
+        self.check_favorite_status(self.combo.currentText())
+        self.refresh_model() # 同时也刷新下拉列表的分类标题颜色
 
     def toggle_favorite(self):
         """点击收藏/取消收藏按钮时的逻辑"""
@@ -462,7 +510,11 @@ class MainWindow(QMainWindow):
         self.viz_node_color = "#ff3333" 
         self.last_viz_splitter_sizes = [600, 400] # 存储属性表隐藏前的比例
         
+        # 默认主题
+        self.current_theme = 'dark'
+
         self.init_style()
+        self.init_menu_bar() # 初始化菜单栏
         
         # Central Widget
         central_widget = QWidget()
@@ -495,39 +547,73 @@ class MainWindow(QMainWindow):
         self.init_defaults()
 
     def init_style(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #f5f6fa; }
-            QLabel#TitleLabel { font-size: 24px; font-weight: bold; color: #2c3e50; margin-bottom: 5px; }
-            QLabel { font-size: 13px; color: #2f3640; }
-            QLineEdit { padding: 6px; border: 1px solid #dcdde1; border-radius: 4px; background-color: white; }
-            QPushButton { padding: 6px 12px; border-radius: 4px; background-color: #ecf0f1; border: 1px solid #bdc3c7; }
-            QPushButton:hover { background-color: #bdc3c7; }
-            
-            QPushButton#PrimaryBtn { background-color: #3498db; color: white; border: none; font-weight: bold; }
-            QPushButton#PrimaryBtn:hover { background-color: #2980b9; }
-            QPushButton#PrimaryBtn:disabled { background-color: #95a5a6; }
-            
-            QPushButton#SuccessBtn { background-color: #2ecc71; color: white; border: none; font-weight: bold; }
-            QPushButton#SuccessBtn:hover { background-color: #27ae60; }
-            QPushButton#SuccessBtn:disabled { background-color: #95a5a6; }
+        # 使用全局主题 (app/theme.py)
+        # 实际的 theme apply 将由 toggle_theme 控制，这里可以保留一些组件特定的样式
+        # 但要注意这些样式也应该根据主题变化
+        # 为了简化，我们尽量让 theme.py 处理所有通用样式，这里只处理极少数特例
+        
+        # 初始应用默认主题 (如果 load_settings 还没运行，默认是 dark)
+        # load_settings 会覆盖它
+        app = QApplication.instance()
+        if app:
+            apply_theme(app, self.current_theme)
 
-            QPushButton#StopBtn { background-color: #e74c3c; color: white; border: none; font-weight: bold; }
-            QPushButton#StopBtn:hover { background-color: #c0392b; }
-            QPushButton#StopBtn:disabled { background-color: #95a5a6; }
+    def init_menu_bar(self):
+        """初始化菜单栏"""
+        menu_bar = self.menuBar()
+        
+        # 设置菜单
+        settings_menu = menu_bar.addMenu("设置")
+        
+        # 主题切换子菜单
+        theme_menu = settings_menu.addMenu("切换主题")
+        
+        # 深色主题 Action
+        self.action_dark = QAction("深色主题 (Dark)", self)
+        self.action_dark.setCheckable(True)
+        self.action_dark.triggered.connect(lambda: self.switch_theme('dark'))
+        theme_menu.addAction(self.action_dark)
+        
+        # 浅色主题 Action
+        self.action_light = QAction("浅色主题 (Light)", self)
+        self.action_light.setCheckable(True)
+        self.action_light.triggered.connect(lambda: self.switch_theme('light'))
+        theme_menu.addAction(self.action_light)
+        
+        # 互斥逻辑由 update_theme_menu_state 处理
 
-            QGroupBox { font-weight: bold; border: 1px solid #dcdde1; border-radius: 6px; margin-top: 6px; padding-top: 5px; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+    def switch_theme(self, theme_name):
+        """切换主题逻辑"""
+        self.current_theme = theme_name
+        
+        # 应用主题
+        app = QApplication.instance()
+        if app:
+            apply_theme(app, theme_name)
             
-            QTableView, QTableWidget { border: 1px solid #dcdde1; gridline-color: #ecf0f1; }
-            QHeaderView::section { background-color: #ecf0f1; padding: 4px; border: none; border-right: 1px solid #bdc3c7; font-weight: bold; }
-            QTabWidget::pane { border: 1px solid #bdc3c7; background: white; }
-            QTabBar::tab { background: #ecf0f1; padding: 8px 20px; border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px; }
-            QTabBar::tab:selected { background: white; border-bottom: 2px solid #3498db; color: #3498db; font-weight: bold; }
-            
-            /* Disabled Style */
-            QLabel:disabled { color: #95a5a6; }
-            QGroupBox:disabled { color: #95a5a6; border-color: #bdc3c7; }
-        """)
+        # 更新菜单勾选状态
+        self.update_theme_menu_state()
+        
+        # 刷新 CoordSysSelector 的样式
+        if hasattr(self, 'coord_selector'):
+            self.coord_selector.update_theme_style()
+        
+        # 如果需要重新加载某些特定样式（比如地图底图），在这里处理
+        if hasattr(self, 'update_viz_map'):
+            self.update_viz_map() # 刷新地图以应用新的底图颜色
+
+    def update_theme_menu_state(self):
+        """更新菜单项的勾选状态"""
+        is_dark = (self.current_theme == 'dark')
+        self.action_dark.setChecked(is_dark)
+        self.action_light.setChecked(not is_dark)
+    
+    def get_map_tiles(self):
+        """根据当前主题返回合适的底图"""
+        if self.current_theme == 'dark':
+            return 'CartoDB dark_matter'
+        else:
+            return 'CartoDB positron' # 浅色底图
 
     # =============================================================================================
     #  Tab 1: Main Interface (Process, Filter, Visualize)
@@ -1285,35 +1371,43 @@ class MainWindow(QMainWindow):
                 if len(selected_block_ids) == 1:
                     sel_id = selected_block_ids[0]
                     if sel_id != max_block_id:
-                        reply = QMessageBox.question(
-                            self, "提示", 
-                            f"您选择的区块 (ID: {sel_id}) 不是最大的路网区块 (最大ID: {max_block_id})。\n是否继续导出？",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                            QMessageBox.StandardButton.No
+                        msg = QMessageBox(self)
+                        msg.setIcon(QMessageBox.Icon.Question)
+                        msg.setWindowTitle("提示")
+                        msg.setText(
+                            f"您选择的区块 (ID: {sel_id}) 不是最大的路网区块 (最大ID: {max_block_id})。\n是否继续导出？"
                         )
-                        # 设置按钮文本
-                        yes_btn = reply.button(QMessageBox.StandardButton.Yes)
-                        yes_btn.setText("继续")
-                        no_btn = reply.button(QMessageBox.StandardButton.No)
-                        no_btn.setText("取消")
-                        
-                        if reply.exec() == QMessageBox.StandardButton.No:
+                        msg.setStandardButtons(
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
+                        msg.setDefaultButton(QMessageBox.StandardButton.No)
+                        yes_btn = msg.button(QMessageBox.StandardButton.Yes)
+                        if yes_btn is not None:
+                            yes_btn.setText("继续")
+                        no_btn = msg.button(QMessageBox.StandardButton.No)
+                        if no_btn is not None:
+                            no_btn.setText("取消")
+
+                        if msg.exec() == QMessageBox.StandardButton.No:
                             return
                 else:
                     # 选择了多个
-                    reply = QMessageBox.question(
-                        self, "提示",
-                        "您选择了多个区块，导出的路网可能不连续。\n是否继续导出？",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Icon.Question)
+                    msg.setWindowTitle("提示")
+                    msg.setText("您选择了多个区块，导出的路网可能不连续。\n是否继续导出？")
+                    msg.setStandardButtons(
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                     )
-                    # 设置按钮文本
-                    yes_btn = reply.button(QMessageBox.StandardButton.Yes)
-                    yes_btn.setText("继续")
-                    no_btn = reply.button(QMessageBox.StandardButton.No)
-                    no_btn.setText("取消")
-                    
-                    if reply.exec() == QMessageBox.StandardButton.No:
+                    msg.setDefaultButton(QMessageBox.StandardButton.No)
+                    yes_btn = msg.button(QMessageBox.StandardButton.Yes)
+                    if yes_btn is not None:
+                        yes_btn.setText("继续")
+                    no_btn = msg.button(QMessageBox.StandardButton.No)
+                    if no_btn is not None:
+                        no_btn.setText("取消")
+
+                    if msg.exec() == QMessageBox.StandardButton.No:
                         return
 
             self.start_worker_task('filter_and_export')
@@ -1775,7 +1869,8 @@ class MainWindow(QMainWindow):
             
         try:
             # Create Map
-            m = folium.Map(location=[39.9, 116.4], zoom_start=12, tiles='CartoDB positron')
+            tiles = self.get_map_tiles()
+            m = folium.Map(location=[39.9, 116.4], zoom_start=12, tiles=tiles)
             
             # Auto-center
             bounds = None
@@ -1817,6 +1912,16 @@ class MainWindow(QMainWindow):
 
             # Save to temp
             data = m._repr_html_()
+            
+            # 设置 WebEngine 背景色
+            if self.current_theme == 'dark':
+                self.web_view.setStyleSheet("background-color: #2a2a2a;")
+                # 在 HTML 中注入背景色以防止白屏闪烁
+                data = data.replace('</head>', '<style>body { background-color: #2a2a2a; color: white; }</style></head>')
+            else:
+                self.web_view.setStyleSheet("background-color: white;")
+                data = data.replace('</head>', '<style>body { background-color: white; color: black; }</style></head>')
+
             self.web_view.setHtml(data)
             
         except Exception as e:
@@ -1888,6 +1993,16 @@ class MainWindow(QMainWindow):
                 if last_crs and hasattr(self, 'coord_selector'):
                     self.coord_selector.combo.setCurrentText(last_crs)
                     self.coord_selector.check_favorite_status(last_crs)
+                    
+                # Restore Theme
+                saved_theme = data.get('theme', 'dark')
+                # 验证有效性
+                if saved_theme not in ['dark', 'light']:
+                    saved_theme = 'dark'
+                
+                # 应用并更新UI
+                self.switch_theme(saved_theme)
+                
         except Exception as e:
             print(f"Error loading settings: {e}")
 
@@ -1902,7 +2017,8 @@ class MainWindow(QMainWindow):
                 'osm_file': self.osm_file_input.text(),
                 'link_file': self.link_file_input.text(),
                 'node_file': self.node_file_input.text(),
-                'last_mode_id': self.mode_bg.checkedId()
+                'last_mode_id': self.mode_bg.checkedId(),
+                'theme': self.current_theme # Save Theme
             }
             
             # Save favorites and current selection

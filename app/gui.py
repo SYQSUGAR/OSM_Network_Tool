@@ -555,6 +555,11 @@ class MainWindow(QMainWindow):
         
         # Defaults
         self.init_defaults()
+        
+        # ====== 新增：程序启动时立刻加载一次空白底图 ======
+        if WEB_ENGINE_AVAILABLE:
+            self.update_viz_map()
+        # ===============================================
 
     def init_style(self):
         # 使用全局主题 (app/theme.py)
@@ -991,7 +996,7 @@ class MainWindow(QMainWindow):
         
         if WEB_ENGINE_AVAILABLE:
             self.web_view = QWebEngineView()
-            self.web_view.setHtml("<html><body><h3 align='center'>请先生成预览数据</h3></body></html>")
+            # self.web_view.setHtml("<html><body><h3 align='center'>请先生成预览数据</h3></body></html>")
             self.viz_splitter.addWidget(self.web_view)
         else:
             lbl = QLabel("WebEngine not available")
@@ -2290,125 +2295,75 @@ class MainWindow(QMainWindow):
         links = self.processor.preview_links_gdf
         nodes = self.processor.preview_nodes_gdf
         
-        if links is None and nodes is None:
-            return
+        # ❌ 移除这个拦截：允许在没有数据时，渲染一张干净的底图
+        # if links is None and nodes is None:
+        #     return
             
         try:
-            # Create Map
+            # 1. 创建基础地图 (默认中心定在北京)
             tiles = self.get_map_tiles()
-            # 初始中心
-            start_loc = [39.9, 116.4]
-            # 计算 Bounds
+            m = folium.Map(location=[39.9, 116.4], zoom_start=11, tiles=tiles)
+            
+            # 2. 自适应缩放
             bounds = None
             if links is not None and not links.empty:
                 bounds = links.total_bounds
-                start_loc = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
             elif nodes is not None and not nodes.empty:
                 bounds = nodes.total_bounds
-                start_loc = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
-            
-            m = folium.Map(location=start_loc, zoom_start=12, tiles=tiles)
-            
+                
             if bounds is not None:
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-            # Draw Links
+            # 3. 绘制 Links
             if self.cb_show_links.isChecked() and links is not None and not links.empty:
-                # 获取样式配置
-                attr = self.link_style_config.get('attr')
-                mapping = self.link_style_config.get('mapping', {})
-                default_color = "#3388ff"
-                
-                # 定义样式函数
-                def link_style_fn(feature):
-                    color = default_color
-                    if attr and 'properties' in feature and attr in feature['properties']:
-                        val = str(feature['properties'][attr])
-                        color = mapping.get(val, default_color)
+                attr = self.combo_link_attr.currentText()
+                def style_fn(feature):
                     return {
-                        'color': color,
-                        'weight': 3,
-                        'opacity': 0.8
+                        'color': self.viz_link_color,
+                        'weight': 2,
+                        'opacity': 0.7
                     }
-                
                 folium.GeoJson(
                     links,
                     name="Links",
-                    style_function=link_style_fn,
-                    tooltip=folium.GeoJsonTooltip(fields=[attr] if attr in links.columns else None)
+                    style_function=style_fn,
+                    tooltip=folium.GeoJsonTooltip(fields=[attr] if attr else None)
                 ).add_to(m)
 
-            # Draw Nodes
+            # 4. 绘制 Nodes (加入安全限制机制！)
             if self.cb_show_nodes.isChecked() and nodes is not None and not nodes.empty:
-                # 获取样式配置
-                attr = self.node_style_config.get('attr')
-                mapping = self.node_style_config.get('mapping', {})
-                default_color = "#ff3333"
+                # 核心优化：限制网页上渲染的圆点数量，防止浏览器内核白屏崩溃
+                max_nodes = 1500 
+                nodes_to_draw = nodes.iloc[:max_nodes] if len(nodes) > max_nodes else nodes
                 
-                # Node 渲染比较特殊，GeoJson 不支持 CircleMarker 的动态样式太好
-                # 使用 CircleMarker 循环添加
-                # 为了性能，如果点太多 (>2000)，可能需要考虑 Cluster 或简化
-                
-                # 优化：如果数据量大，只显示部分或使用 Circle
-                max_nodes = 5000
-                if len(nodes) > max_nodes:
-                    # Sample or warn? Just show first N for now to avoid crash
-                    nodes_to_draw = nodes.iloc[:max_nodes]
-                else:
-                    nodes_to_draw = nodes
-
                 for _, row in nodes_to_draw.iterrows():
-                    color = default_color
-                    if attr and attr in row:
-                        val = str(row[attr])
-                        color = mapping.get(val, default_color)
-                        
                     folium.CircleMarker(
                         location=[row.geometry.y, row.geometry.x],
-                        radius=4,
-                        color=color,
+                        radius=3,
+                        color=self.viz_node_color,
                         fill=True,
-                        fill_color=color,
-                        fill_opacity=0.9,
-                        popup=str(row.to_dict()) if len(nodes) < 1000 else None # Reduce popup overhead
+                        popup=str(row.to_dict()) if len(nodes_to_draw) < 1000 else None
                     ).add_to(m)
 
-            # Save to temp file to solve "Unable to open"
-            # Cleanup old temp file if exists
-            if self.current_map_path and os.path.exists(self.current_map_path):
-                try:
-                    os.remove(self.current_map_path)
-                except Exception:
-                    pass
-
-            fd, tmp_path = tempfile.mkstemp(suffix='.html')
-            os.close(fd) # Close handle, keep file
-            self.current_map_path = tmp_path
+            # 5. 提取完整的 HTML 代码，而不是 iframe (解决白屏不显示的核心)
+            html_data = m.get_root().render()
             
-            m.save(tmp_path)
-            
-            # 注入 CSS (Background)
-            with open(tmp_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
+            # 6. 设置背景色并注入 HTML
             bg_color = "#2a2a2a" if self.current_theme == 'dark' else "white"
             text_color = "white" if self.current_theme == 'dark' else "black"
             
+            self.web_view.setStyleSheet(f"background-color: {bg_color};")
             style_tag = f"<style>body {{ background-color: {bg_color}; color: {text_color}; }}</style>"
-            content = content.replace('</head>', f'{style_tag}</head>')
-            
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+            html_data = html_data.replace('</head>', f'{style_tag}</head>')
 
-            # Load using QUrl
-            self.web_view.setUrl(QUrl.fromLocalFile(tmp_path))
-            # Keep reference to avoid deletion? Temp file persists on disk until OS cleans up or we do.
-            # For this session, it's fine.
+            # 使用特定的 QUrl 绕过 Chromium 的本地安全策略限制
+            from PyQt6.QtCore import QUrl
+            self.web_view.setHtml(html_data, QUrl("file://"))
             
         except Exception as e:
             self.log(f"Map Error: {e}")
             import traceback
-            traceback.print_exc()
+            self.log(traceback.format_exc())
 
     def pick_color(self, target):
         pass # Deprecated

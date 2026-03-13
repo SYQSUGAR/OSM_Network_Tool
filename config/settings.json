@@ -8,6 +8,22 @@
     "node_file": "E:/1工作/科研项目/软件开发/爬取代码/output/node.csv",
     "last_mode_id": 3,
     "theme": "light",
+    "link_style": {
+        "attr": "道路等级",
+        "mapping": {
+            "0": "#f29191",
+            "1": "#def291",
+            "2": "#91f2b8",
+            "3": "#91b8f2",
+            "4": "#de91f2"
+        }
+    },
+    "node_style": {
+        "attr": "类型",
+        "mapping": {
+            "2": "#e52d2d"
+        }
+    },
     "crs_favorites": [
         "CGCS2000 (EPSG:4490) - 2000国家大地坐标系",
         "WGS 84 / Pseudo-Mercator (EPSG:3857) - 网页地图通用",

@@ -9,8 +9,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableView, QHeaderView, QSplitter, QComboBox, QColorDialog, QTableWidget, QTableWidgetItem,
                              QCompleter, QMenuBar, QMenu)
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QAction
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QAbstractTableModel, QUrl
 from shapely import wkt
+import tempfile
+import random
 import geopandas as gpd
 
 try:
@@ -431,7 +433,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("OSM路网工具")
-        self.resize(1200, 800)
+        self.resize(1400, 900)
         
         # Paths Setup
         # Determine Application Root
@@ -510,6 +512,14 @@ class MainWindow(QMainWindow):
         self.viz_node_color = "#ff3333" 
         self.last_viz_splitter_sizes = [600, 400] # 存储属性表隐藏前的比例
         
+        # 样式配置存储 (Attribute -> {Class: Color})
+        # 结构: {'attr': 'highway', 'mapping': {'motorway': '#ff0000', ...}}
+        self.link_style_config = {'attr': None, 'mapping': {}}
+        self.node_style_config = {'attr': None, 'mapping': {}}
+        # 避免在自动更新时触发不必要的重绘或保存
+        self._updating_style_ui = False
+        self.current_map_path = None # 跟踪当前的临时地图文件
+
         # 默认主题
         self.current_theme = 'dark'
 
@@ -928,52 +938,55 @@ class MainWindow(QMainWindow):
         
         # --- Right Column (Visualization) ---
         self.viz_group = QGroupBox("3. 可视化展示")
-        right_layout = QVBoxLayout(self.viz_group)
+        # Use QHBoxLayout for collapsible sidebar
+        right_layout = QHBoxLayout(self.viz_group)
+        right_layout.setContentsMargins(0, 0, 0, 0)
         
-        # Controls
-        viz_ctrl = QHBoxLayout()
-        self.cb_show_links = QCheckBox("Link"); self.cb_show_links.setChecked(True)
-        self.cb_show_nodes = QCheckBox("Node"); self.cb_show_nodes.setChecked(True)
-        viz_ctrl.addWidget(self.cb_show_links)
-        viz_ctrl.addWidget(self.cb_show_nodes)
+        # Splitter for Map (Left) and Style Panel (Right)
+        self.viz_inner_splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        viz_ctrl.addWidget(QLabel("Link颜色:"))
-        self.combo_link_attr = QComboBox()
-        viz_ctrl.addWidget(self.combo_link_attr)
-        self.btn_link_color = QPushButton("")
-        self.btn_link_color.setFixedSize(20, 20)
-        self.btn_link_color.setStyleSheet(f"background-color: {self.viz_link_color}; border: none;")
-        self.btn_link_color.clicked.connect(lambda: self.pick_color('link'))
-        viz_ctrl.addWidget(self.btn_link_color)
+        # === Map Container (Left) ===
+        self.map_container = QWidget()
+        map_layout = QVBoxLayout(self.map_container)
+        map_layout.setContentsMargins(5, 5, 5, 5)
 
-        viz_ctrl.addWidget(QLabel("Node颜色:"))
-        self.combo_node_attr = QComboBox()
-        viz_ctrl.addWidget(self.combo_node_attr)
-        self.btn_node_color = QPushButton("")
-        self.btn_node_color.setFixedSize(20, 20)
-        self.btn_node_color.setStyleSheet(f"background-color: {self.viz_node_color}; border: none;")
-        self.btn_node_color.clicked.connect(lambda: self.pick_color('node'))
-        viz_ctrl.addWidget(self.btn_node_color)
+        # Top Controls (Moved to Map Container Top)
+        viz_ctrl_top = QHBoxLayout()
         
-        viz_ctrl.addStretch()
-        
-        self.preview_btn = QPushButton("生成预览")
-        self.preview_btn.clicked.connect(self.start_preview_generation)
-        viz_ctrl.addWidget(self.preview_btn)
+        self.btn_load_data = QPushButton("生成/刷新数据")
+        self.btn_load_data.setObjectName("PrimaryBtn")
+        self.btn_load_data.clicked.connect(self.start_preview_generation)
+        viz_ctrl_top.addWidget(self.btn_load_data)
 
-        self.btn_update_map = QPushButton("更新地图")
+        self.btn_update_map = QPushButton("更新样式")
+        self.btn_update_map.setObjectName("SuccessBtn")
         self.btn_update_map.clicked.connect(self.update_viz_map)
-        viz_ctrl.addWidget(self.btn_update_map)
+        viz_ctrl_top.addWidget(self.btn_update_map)
         
-        # Show/Hide Attr Table Button (Main Viz Control)
-        self.btn_show_attr = QPushButton("属性表")
+        self.cb_show_links = QCheckBox("显示Link")
+        self.cb_show_links.setChecked(True)
+        self.cb_show_nodes = QCheckBox("显示Node")
+        self.cb_show_nodes.setChecked(True)
+        viz_ctrl_top.addWidget(self.cb_show_links)
+        viz_ctrl_top.addWidget(self.cb_show_nodes)
+        
+        # Show/Hide Attr Table Button
+        self.btn_show_attr = QPushButton("显示属性表")
         self.btn_show_attr.setCheckable(True)
         self.btn_show_attr.clicked.connect(self.toggle_attr_table_visibility)
-        viz_ctrl.addWidget(self.btn_show_attr)
+        viz_ctrl_top.addWidget(self.btn_show_attr)
         
-        right_layout.addLayout(viz_ctrl)
+        # Toggle Style Panel Button
+        self.btn_toggle_style = QPushButton("样式设置 >>")
+        self.btn_toggle_style.setCheckable(True)
+        self.btn_toggle_style.setChecked(True)
+        self.btn_toggle_style.clicked.connect(self.toggle_style_panel)
+        viz_ctrl_top.addWidget(self.btn_toggle_style)
         
-        # Map
+        viz_ctrl_top.addStretch()
+        map_layout.addLayout(viz_ctrl_top)
+        
+        # Map & Attr Splitter
         self.viz_splitter = QSplitter(Qt.Orientation.Vertical)
         
         if WEB_ENGINE_AVAILABLE:
@@ -1044,13 +1057,77 @@ class MainWindow(QMainWindow):
         
         self.bottom_viz_container.hide() # Initial state: Hidden
         
-        right_layout.addWidget(self.viz_splitter)
+        map_layout.addWidget(self.viz_splitter)
+        self.viz_inner_splitter.addWidget(self.map_container)
+        
+        # === Style Panel (Right Sidebar) ===
+        self.style_panel = QWidget()
+        self.style_panel.setMinimumWidth(250)
+        self.style_panel.setMaximumWidth(400)
+        style_layout_main = QVBoxLayout(self.style_panel)
+        style_layout_main.setContentsMargins(0, 5, 5, 5)
+        
+        # 2. Styling Section (Class-based Styling)
+        style_group = QGroupBox("样式分级设置")
+        style_layout = QVBoxLayout(style_group)
+        style_layout.setContentsMargins(5, 5, 5, 5)
+
+        # 2.1 Type Selection (Link vs Node)
+        row_type = QHBoxLayout()
+        self.style_bg = QButtonGroup(self)
+        self.rb_style_link = QRadioButton("Link样式")
+        self.rb_style_node = QRadioButton("Node样式")
+        self.rb_style_link.setChecked(True)
+        self.style_bg.addButton(self.rb_style_link, 1)
+        self.style_bg.addButton(self.rb_style_node, 2)
+        # Connect signal to handler
+        self.style_bg.idClicked.connect(self.on_style_target_changed)
+
+        row_type.addWidget(QLabel("配置对象:"))
+        row_type.addWidget(self.rb_style_link)
+        row_type.addWidget(self.rb_style_node)
+        row_type.addStretch()
+        style_layout.addLayout(row_type)
+
+        # 2.2 Attribute & Scheme Selection
+        row_cfg = QVBoxLayout() # Changed to VBox for sidebar
+        row_cfg.addWidget(QLabel("分级字段:"))
+        self.combo_style_attr = QComboBox()
+        self.combo_style_attr.currentTextChanged.connect(self.on_style_attr_changed)
+        row_cfg.addWidget(self.combo_style_attr)
+
+        row_cfg.addWidget(QLabel("颜色方案:"))
+        self.combo_color_scheme = QComboBox()
+        self.combo_color_scheme.addItems(["默认 (Default)", "鲜艳 (Vivid)", "柔和 (Pastel)", "深色 (Dark)", "单色 (Mono)"])
+        self.combo_color_scheme.currentIndexChanged.connect(self.apply_color_scheme_to_table)
+        row_cfg.addWidget(self.combo_color_scheme)
+        
+        style_layout.addLayout(row_cfg)
+
+        # 2.3 Class-Color Table
+        self.style_table = QTableWidget()
+        self.style_table.setColumnCount(3) # Increased to 3 for Chinese Name
+        self.style_table.setHorizontalHeaderLabels(["等级/类型", "中文名称", "颜色"])
+        self.style_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.style_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.style_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.style_table.setColumnWidth(2, 60)
+        self.style_table.cellDoubleClicked.connect(self.on_style_table_double_click)
+        style_layout.addWidget(self.style_table)
+        
+        style_layout_main.addWidget(style_group)
+        
+        self.viz_inner_splitter.addWidget(self.style_panel)
+        
+        # Add Inner Splitter to Viz Group
+        right_layout.addWidget(self.viz_inner_splitter)
             
         self.main_splitter.addWidget(self.viz_group)
         
-        # Set initial sizes (Left bigger than before, e.g., 40% : 60% or 45% : 55%)
-        # Previous was 1:2 (33% : 66%). Let's try 450 : 750 (approx 3:5)
+        # Set initial sizes
         self.main_splitter.setSizes([450, 750])
+        # Inner splitter ratio
+        self.viz_inner_splitter.setSizes([800, 300])
         
         layout.addWidget(self.main_splitter)
 
@@ -1416,7 +1493,8 @@ class MainWindow(QMainWindow):
         if not is_busy:
             self.run_btn.setEnabled(checked)
             self.export_filtered_btn.setEnabled(True)
-            self.preview_btn.setEnabled(True)
+            self.btn_load_data.setEnabled(True)
+            self.btn_update_map.setEnabled(True)
         # =====================================================================
         
         # 2. Filtering Table & Stats (Disabled when unchecked)
@@ -1658,7 +1736,8 @@ class MainWindow(QMainWindow):
             # 1. 在任务运行期间，禁用所有“开始”类按钮
             self.run_btn.setEnabled(False)
             self.export_filtered_btn.setEnabled(False)
-            self.preview_btn.setEnabled(False)
+            self.btn_load_data.setEnabled(False)
+            self.btn_update_map.setEnabled(False)
             
             # 2. 根据任务类型，仅启用对应的“停止”按钮
             if is_preprocess_task:
@@ -1682,7 +1761,8 @@ class MainWindow(QMainWindow):
             # 3. 任务结束（正常或停止）后，恢复所有“开始”按钮
             self.run_btn.setEnabled(self.format_conversion_checkbox.isChecked())
             self.export_filtered_btn.setEnabled(True)
-            self.preview_btn.setEnabled(True)
+            self.btn_load_data.setEnabled(True)
+            self.btn_update_map.setEnabled(True)
             
             # 4. 任务结束后，禁用所有“停止”按钮
             self.btn_stop_preprocess.setEnabled(False)
@@ -1932,24 +2012,277 @@ class MainWindow(QMainWindow):
             total = self.viz_splitter.height()
             self.viz_splitter.setSizes([int(total*0.6), int(total*0.4)])
 
-    # --- Visualization Helpers ---
-    def update_viz_combos(self):
-        # Update attribute combos based on available columns in preview gdf
-        if self.processor.preview_links_gdf is not None:
-            cols = self.processor.preview_links_gdf.columns.tolist()
-            current = self.combo_link_attr.currentText()
-            self.combo_link_attr.clear()
-            self.combo_link_attr.addItems([c for c in cols if c != 'geometry'])
-            if current in cols: self.combo_link_attr.setCurrentText(current)
-            else: 
-                # Prefer '道路等级' or 'highway'
-                default = '道路等级' if '道路等级' in cols else ('highway' if 'highway' in cols else cols[0])
-                self.combo_link_attr.setCurrentText(default)
+    def toggle_style_panel(self):
+        """Show/Hide Style Panel"""
+        visible = self.btn_toggle_style.isChecked()
+        if visible:
+            self.style_panel.show()
+            self.btn_toggle_style.setText("样式设置 >>")
+        else:
+            self.style_panel.hide()
+            self.btn_toggle_style.setText("<< 样式设置")
 
-        if self.processor.preview_nodes_gdf is not None:
-            cols = self.processor.preview_nodes_gdf.columns.tolist()
-            self.combo_node_attr.clear()
-            self.combo_node_attr.addItems([c for c in cols if c != 'geometry'])
+    # --- Visualization Helpers ---
+
+    def on_style_target_changed(self, id):
+        """Link/Node 样式切换"""
+        self.update_viz_combos()
+        # 切换时，恢复之前的配置 (如果有)
+        is_link = (id == 1)
+        config = self.link_style_config if is_link else self.node_style_config
+        
+        if config['attr']:
+            self.combo_style_attr.blockSignals(True)
+            self.combo_style_attr.setCurrentText(config['attr'])
+            self.combo_style_attr.blockSignals(False)
+            # 重新填充表格
+            self.populate_style_table(is_link, config['attr'])
+        else:
+            # 如果没有配置，触发一次默认加载
+            self.on_style_attr_changed(self.combo_style_attr.currentText())
+
+    def update_viz_combos(self):
+        """根据当前选中的对象 (Link/Node) 更新属性下拉框"""
+        self.combo_style_attr.blockSignals(True)
+        self.combo_style_attr.clear()
+        
+        cols = []
+        is_link = self.rb_style_link.isChecked()
+        
+        if is_link:
+            if self.processor.preview_links_gdf is not None:
+                cols = [c for c in self.processor.preview_links_gdf.columns if c != 'geometry']
+        else:
+            if self.processor.preview_nodes_gdf is not None:
+                cols = [c for c in self.processor.preview_nodes_gdf.columns if c != 'geometry']
+        
+        if cols:
+            self.combo_style_attr.addItems(cols)
+            
+            # 优先使用已保存的配置
+            config = self.link_style_config if is_link else self.node_style_config
+            saved_attr = config.get('attr')
+            
+            if saved_attr and saved_attr in cols:
+                self.combo_style_attr.setCurrentText(saved_attr)
+            else:
+                # 否则使用默认常用字段
+                defaults = ['道路等级', 'highway', 'type', 'osmid']
+                for d in defaults:
+                    if d in cols:
+                        self.combo_style_attr.setCurrentText(d)
+                        break
+        
+        self.combo_style_attr.blockSignals(False)
+        
+        # 触发属性改变以加载表格
+        if self.combo_style_attr.count() > 0:
+            # 如果当前没有任何选中项 (setCurrentText 没触发改变), 手动触发一次
+            self.on_style_attr_changed(self.combo_style_attr.currentText())
+
+    def on_style_attr_changed(self, attr_name):
+        """当分级字段改变时，重新计算唯一值并填充表格"""
+        if not attr_name: return
+        is_link = self.rb_style_link.isChecked()
+        self.populate_style_table(is_link, attr_name)
+
+    def populate_style_table(self, is_link, attr_name):
+        """填充样式表格"""
+        self._updating_style_ui = True
+        self.style_table.setRowCount(0)
+        
+        df = self.processor.preview_links_gdf if is_link else self.processor.preview_nodes_gdf
+        if df is None or attr_name not in df.columns:
+            self._updating_style_ui = False
+            return
+
+        # 获取唯一值
+        try:
+            unique_vals = df[attr_name].astype(str).unique().tolist()
+            unique_vals.sort()
+            # 限制数量，防止过多卡死
+            if len(unique_vals) > 50:
+                unique_vals = unique_vals[:50]
+        except Exception:
+            unique_vals = []
+
+        self.style_table.setRowCount(len(unique_vals))
+        
+        # 获取当前已有配置 (如果属性没变，保留颜色；如果变了，生成新颜色)
+        config = self.link_style_config if is_link else self.node_style_config
+        existing_mapping = config.get('mapping', {})
+        current_attr = config.get('attr')
+        
+        use_existing = (current_attr == attr_name)
+        
+        # 更新 Config 的 attr
+        config['attr'] = attr_name
+        
+        # 预生成颜色 (如果是新属性)
+        if not use_existing:
+             scheme = self.combo_color_scheme.currentText()
+             new_colors = self._generate_colors(len(unique_vals), scheme)
+             new_mapping = {}
+        
+        # 尝试加载属性映射表 (如果需要)
+        attr_map_dict = {}
+        if is_link:
+            try:
+                # 尝试从映射表中加载
+                # 映射表通常在 self.USER_ATTR_MAP (路网字段属性映射关系.xlsx)
+                # 我们需要找到 '道路等级Num' 和 '道路等级' 的对应关系
+                if os.path.exists(self.USER_ATTR_MAP):
+                    map_df = pd.read_excel(self.USER_ATTR_MAP)
+                    if '道路等级Num' in map_df.columns and '道路等级' in map_df.columns:
+                        for _, row in map_df.iterrows():
+                            # Num -> Text
+                            k = str(row['道路等级Num'])
+                            if k.endswith('.0'): k = k[:-2]
+                            v = str(row['道路等级'])
+                            attr_map_dict[k] = v
+            except Exception:
+                pass
+
+        for i, val in enumerate(unique_vals):
+            # Column 0: Value / Level
+            item_val = QTableWidgetItem(val)
+            item_val.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable) # Read-only
+            self.style_table.setItem(i, 0, item_val)
+            
+            # Column 1: Chinese Name (Only for Link & specific attributes?)
+            cn_name = ""
+            if is_link:
+                # 只有当用户选择了 '道路等级Num' 或者值在映射表中存在时才显示
+                # 实际上如果值能匹配上，就显示，不管选的是什么字段 (只要值是Num)
+                if val in attr_map_dict:
+                    cn_name = attr_map_dict[val]
+            
+            item_cn = QTableWidgetItem(cn_name)
+            item_cn.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            item_cn.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.style_table.setItem(i, 1, item_cn)
+            
+            # Column 2: Color
+            if use_existing and val in existing_mapping:
+                color_hex = existing_mapping[val]
+            else:
+                color_hex = new_colors[i]
+                if not use_existing: new_mapping[val] = color_hex
+            
+            item_color = QTableWidgetItem(color_hex)
+            item_color.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable) # Make Read-Only, force double-click
+            item_color.setBackground(QColor(color_hex))
+            # 设置前景颜色以保证对比度
+            item_color.setForeground(QColor("white") if self._is_dark(color_hex) else QColor("black"))
+            item_color.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.style_table.setItem(i, 2, item_color)
+
+        if not use_existing:
+            config['mapping'] = new_mapping
+            
+        self._updating_style_ui = False
+
+    def apply_color_scheme_to_table(self):
+        """应用选定的颜色方案到当前表格"""
+        if self._updating_style_ui: return
+        
+        rows = self.style_table.rowCount()
+        if rows == 0: return
+        
+        scheme = self.combo_color_scheme.currentText()
+        colors = self._generate_colors(rows, scheme)
+        
+        is_link = self.rb_style_link.isChecked()
+        config = self.link_style_config if is_link else self.node_style_config
+        mapping = config.get('mapping', {})
+        
+        for i in range(rows):
+            val_item = self.style_table.item(i, 0)
+            if not val_item: continue
+            val = val_item.text()
+            
+            color_hex = colors[i]
+            
+            # Update Table (Color is now Col 2)
+            color_item = self.style_table.item(i, 2)
+            if color_item:
+                color_item.setText(color_hex)
+                color_item.setBackground(QColor(color_hex))
+                color_item.setForeground(QColor("white") if self._is_dark(color_hex) else QColor("black"))
+            
+            # Update Config
+            mapping[val] = color_hex
+            
+        config['mapping'] = mapping
+        
+        # 自动更新地图
+        self.update_viz_map()
+
+    def on_style_table_double_click(self, row, col):
+        """双击颜色列进行修改"""
+        if col == 2: # Color column is now 2
+            item = self.style_table.item(row, col)
+            initial_color = QColor(item.text())
+            color = QColorDialog.getColor(initial_color, self, "选择颜色")
+            
+            if color.isValid():
+                hex_color = color.name()
+                item.setText(hex_color)
+                item.setBackground(color)
+                item.setForeground(QColor("white") if self._is_dark(hex_color) else QColor("black"))
+                
+                # Update Config
+                val = self.style_table.item(row, 0).text()
+                is_link = self.rb_style_link.isChecked()
+                config = self.link_style_config if is_link else self.node_style_config
+                config['mapping'][val] = hex_color
+                
+                # 自动更新地图
+                self.update_viz_map()
+
+    def _generate_colors(self, n, scheme):
+        """生成N个颜色的列表"""
+        colors = []
+        import colorsys
+        
+        if "Default" in scheme or "默认" in scheme:
+            # HSL 环绕
+            for i in range(n):
+                hue = i / n
+                rgb = colorsys.hsv_to_rgb(hue, 0.8, 0.9)
+                colors.append('#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)))
+        elif "Vivid" in scheme or "鲜艳" in scheme:
+            # High Saturation
+             for i in range(n):
+                hue = (i * 137.508) % 360 / 360.0 # Golden angle approximation
+                rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                colors.append('#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)))
+        elif "Pastel" in scheme or "柔和" in scheme:
+            # Low Saturation, High Value
+            for i in range(n):
+                hue = i / n
+                rgb = colorsys.hsv_to_rgb(hue, 0.4, 0.95)
+                colors.append('#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)))
+        elif "Dark" in scheme or "深色" in scheme:
+            for i in range(n):
+                hue = i / n
+                rgb = colorsys.hsv_to_rgb(hue, 0.6, 0.4)
+                colors.append('#{:02x}{:02x}{:02x}'.format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)))
+        elif "Mono" in scheme or "单色" in scheme:
+            # Shades of Blue
+            for i in range(n):
+                val = 0.3 + (i / n) * 0.7
+                colors.append('#{:02x}{:02x}{:02x}'.format(0, int(val*100), int(val*255)))
+        else:
+             # Fallback
+             for i in range(n): colors.append("#3388ff")
+             
+        return colors
+
+    def _is_dark(self, hex_color):
+        """判断颜色是否深色 (用于文字反色)"""
+        c = QColor(hex_color)
+        return c.lightness() < 128
 
     def update_viz_map(self):
         if not WEB_ENGINE_AVAILABLE: return
@@ -1963,73 +2296,122 @@ class MainWindow(QMainWindow):
         try:
             # Create Map
             tiles = self.get_map_tiles()
-            m = folium.Map(location=[39.9, 116.4], zoom_start=12, tiles=tiles)
-            
-            # Auto-center
+            # 初始中心
+            start_loc = [39.9, 116.4]
+            # 计算 Bounds
             bounds = None
             if links is not None and not links.empty:
                 bounds = links.total_bounds
+                start_loc = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
             elif nodes is not None and not nodes.empty:
                 bounds = nodes.total_bounds
-                
+                start_loc = [(bounds[1]+bounds[3])/2, (bounds[0]+bounds[2])/2]
+            
+            m = folium.Map(location=start_loc, zoom_start=12, tiles=tiles)
+            
             if bounds is not None:
                 m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
             # Draw Links
-            if self.cb_show_links.isChecked() and links is not None:
-                attr = self.combo_link_attr.currentText()
-                # Simple style function
-                def style_fn(feature):
+            if self.cb_show_links.isChecked() and links is not None and not links.empty:
+                # 获取样式配置
+                attr = self.link_style_config.get('attr')
+                mapping = self.link_style_config.get('mapping', {})
+                default_color = "#3388ff"
+                
+                # 定义样式函数
+                def link_style_fn(feature):
+                    color = default_color
+                    if attr and 'properties' in feature and attr in feature['properties']:
+                        val = str(feature['properties'][attr])
+                        color = mapping.get(val, default_color)
                     return {
-                        'color': self.viz_link_color,
-                        'weight': 2,
-                        'opacity': 0.7
+                        'color': color,
+                        'weight': 3,
+                        'opacity': 0.8
                     }
+                
                 folium.GeoJson(
                     links,
                     name="Links",
-                    style_function=style_fn,
-                    tooltip=folium.GeoJsonTooltip(fields=[attr] if attr else None)
+                    style_function=link_style_fn,
+                    tooltip=folium.GeoJsonTooltip(fields=[attr] if attr in links.columns else None)
                 ).add_to(m)
 
             # Draw Nodes
-            if self.cb_show_nodes.isChecked() and nodes is not None:
-                for _, row in nodes.iterrows():
+            if self.cb_show_nodes.isChecked() and nodes is not None and not nodes.empty:
+                # 获取样式配置
+                attr = self.node_style_config.get('attr')
+                mapping = self.node_style_config.get('mapping', {})
+                default_color = "#ff3333"
+                
+                # Node 渲染比较特殊，GeoJson 不支持 CircleMarker 的动态样式太好
+                # 使用 CircleMarker 循环添加
+                # 为了性能，如果点太多 (>2000)，可能需要考虑 Cluster 或简化
+                
+                # 优化：如果数据量大，只显示部分或使用 Circle
+                max_nodes = 5000
+                if len(nodes) > max_nodes:
+                    # Sample or warn? Just show first N for now to avoid crash
+                    nodes_to_draw = nodes.iloc[:max_nodes]
+                else:
+                    nodes_to_draw = nodes
+
+                for _, row in nodes_to_draw.iterrows():
+                    color = default_color
+                    if attr and attr in row:
+                        val = str(row[attr])
+                        color = mapping.get(val, default_color)
+                        
                     folium.CircleMarker(
                         location=[row.geometry.y, row.geometry.x],
-                        radius=3,
-                        color=self.viz_node_color,
+                        radius=4,
+                        color=color,
                         fill=True,
-                        popup=str(row.to_dict())
+                        fill_color=color,
+                        fill_opacity=0.9,
+                        popup=str(row.to_dict()) if len(nodes) < 1000 else None # Reduce popup overhead
                     ).add_to(m)
 
-            # Save to temp
-            data = m._repr_html_()
-            
-            # 设置 WebEngine 背景色
-            if self.current_theme == 'dark':
-                self.web_view.setStyleSheet("background-color: #2a2a2a;")
-                # 在 HTML 中注入背景色以防止白屏闪烁
-                data = data.replace('</head>', '<style>body { background-color: #2a2a2a; color: white; }</style></head>')
-            else:
-                self.web_view.setStyleSheet("background-color: white;")
-                data = data.replace('</head>', '<style>body { background-color: white; color: black; }</style></head>')
+            # Save to temp file to solve "Unable to open"
+            # Cleanup old temp file if exists
+            if self.current_map_path and os.path.exists(self.current_map_path):
+                try:
+                    os.remove(self.current_map_path)
+                except Exception:
+                    pass
 
-            self.web_view.setHtml(data)
+            fd, tmp_path = tempfile.mkstemp(suffix='.html')
+            os.close(fd) # Close handle, keep file
+            self.current_map_path = tmp_path
+            
+            m.save(tmp_path)
+            
+            # 注入 CSS (Background)
+            with open(tmp_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            bg_color = "#2a2a2a" if self.current_theme == 'dark' else "white"
+            text_color = "white" if self.current_theme == 'dark' else "black"
+            
+            style_tag = f"<style>body {{ background-color: {bg_color}; color: {text_color}; }}</style>"
+            content = content.replace('</head>', f'{style_tag}</head>')
+            
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            # Load using QUrl
+            self.web_view.setUrl(QUrl.fromLocalFile(tmp_path))
+            # Keep reference to avoid deletion? Temp file persists on disk until OS cleans up or we do.
+            # For this session, it's fine.
             
         except Exception as e:
             self.log(f"Map Error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def pick_color(self, target):
-        color = QColorDialog.getColor()
-        if color.isValid():
-            hex_color = color.name()
-            if target == 'link':
-                self.viz_link_color = hex_color
-                self.btn_link_color.setStyleSheet(f"background-color: {hex_color}; border: none;")
-            else:
-                self.viz_node_color = hex_color
-                self.btn_node_color.setStyleSheet(f"background-color: {hex_color}; border: none;")
+        pass # Deprecated
 
     def log(self, msg):
         if self.current_log_widget:
@@ -2095,6 +2477,19 @@ class MainWindow(QMainWindow):
                 
                 # 应用并更新UI
                 self.switch_theme(saved_theme)
+
+                # Restore Styles
+                link_style = data.get('link_style')
+                if isinstance(link_style, dict):
+                     self.link_style_config = link_style
+                
+                node_style = data.get('node_style')
+                if isinstance(node_style, dict):
+                     self.node_style_config = node_style
+                
+                # Update UI to reflect loaded link style (default active tab)
+                if self.link_style_config.get('attr'):
+                     self.on_style_target_changed(1) # Refresh UI for Link
                 
         except Exception as e:
             print(f"Error loading settings: {e}")
@@ -2111,7 +2506,9 @@ class MainWindow(QMainWindow):
                 'link_file': self.link_file_input.text(),
                 'node_file': self.node_file_input.text(),
                 'last_mode_id': self.mode_bg.checkedId(),
-                'theme': self.current_theme # Save Theme
+                'theme': self.current_theme, # Save Theme
+                'link_style': self.link_style_config, # Save Link Style
+                'node_style': self.node_style_config  # Save Node Style
             }
             
             # Save favorites and current selection
@@ -2130,6 +2527,13 @@ class MainWindow(QMainWindow):
         self.on_format_conversion_toggled(self.format_conversion_checkbox.isChecked())
 
     def closeEvent(self, event):
+        # Cleanup temp file
+        if self.current_map_path and os.path.exists(self.current_map_path):
+            try:
+                os.remove(self.current_map_path)
+            except Exception:
+                pass
+        
         # Save settings on exit
         self.save_settings()
         event.accept()
